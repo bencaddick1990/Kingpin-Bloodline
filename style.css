@@ -66,3 +66,20 @@ input:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 #start:not(.p4){cursor:pointer}
 #start.p4{cursor:default}
 @media (prefers-reduced-motion:reduce){#start *{transition:none!important}}
+
+.pc{display:inline-flex;flex-direction:column;align-items:center;justify-content:center;width:46px;height:64px;margin:0 4px 4px 0;background:#f4efe3;color:#111;border-radius:6px;border:1px solid #000;font:700 18px 'Barlow Condensed',sans-serif;line-height:1.05}
+.pc i{font-style:normal;font-size:20px}
+.pc.rd{color:#c0233b}
+.pc.back{background:repeating-linear-gradient(45deg,#7a2b2b,#7a2b2b 6px,#5a1f1f 6px,#5a1f1f 12px);border-color:#e3a73b}
+.hand{display:flex;flex-wrap:wrap;min-height:68px;margin-bottom:6px}
+.reels{display:flex;gap:8px;justify-content:center;margin:10px 0}
+.reel{width:30%;max-width:110px;aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:48px;background:#0B0F14;border:2px solid var(--amber);border-radius:12px}
+.rgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.rgrid button,.btns button.rr,.btns button.rb{min-height:40px;padding:4px 0;font-size:14px}
+button.rr{background:#c8374f;border-color:#c8374f;color:#fff}
+button.rb{background:#1b1f27;border-color:#3a4658;color:#fff}
+button.rg{background:#23863b;border-color:#23863b;color:#fff}
+button.sel{outline:3px solid var(--amber);outline-offset:1px}
+.btns button.sel{outline:3px solid var(--amber)}
+.wl{position:relative;width:min(78vw,300px);aspect-ratio:1;margin:8px auto}
+.wl svg{position:absolute;inset:0;width:100%;height:100%}
