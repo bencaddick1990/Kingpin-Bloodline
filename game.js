@@ -39,7 +39,7 @@
  *  endDay() -> upkeep (pocket, then bank) / eviction -> sleep(bed):      |
  *      robbery roll -> cold/hunger -> S.day++ -> raid(heat roll)         |
  *      -> finishBatches -> coolMarkets -> roll() new prices              |
- *      -> crewYear -> yearXp (profit -> XP -> level unlocks)             |
+ *      -> crewYear -> yearXp (realised profit - losses -> XP -> unlocks) |
  *      -> death/age check -> render() ----------------------------------+
  *
  *  DEATH: S.hp<=0 or S.day>DAYS -> S.view='over' -> heir(sex) builds a new
@@ -50,8 +50,9 @@
  *
  *  KEY STATE FIELDS (S): day, gen, cash, bank, hp, food, loc, inv{}, paid{},
  *  prices{}, flag{}, props[], guns[], bag, xp, bribe, fat{} (market fatigue),
- *  mk{} (this visit's pre-trade prices, the anti round-trip guard),
- *  yp{} (yearly profit trackers), fam[], line[], look{}, view, tab, ev, log[]
+ *  base{} (this board's prices BEFORE fatigue, used by buyAt/sellAt),
+ *  yp{} (yearly XP ledger: sale margins, losses, carried shortfall),
+ *  fam[], line[], look{}, view, tab, ev, log[]
  * ========================================================================== */
 
 
@@ -60,7 +61,7 @@
  * ========================================================================== */
 
 /** VERSION NUMBER: change the number on the next line each release. */
-var VERSION='0.52';
+var VERSION='0.53';
 
 /** Game-wide constants.
  *  CAP  : pocket slots with no bag.
@@ -887,17 +888,38 @@ function levelList(){var h='<p class="lead"><b>Level unlocks.</b> Everything you
 function note(t,d){ask(t,d,[{l:'OK',fn:function(){}}])}
 
 /**
- * Yearly profit tracker (YP). `i` = money IN from sales this year,
- * `o` = money OUT on stock/ingredients. Created lazily on first use.
- * @returns {{i:number,o:number}}
+ * YEARLY XP LEDGER (YP). XP is earned on REALISED PROFIT, not on cash flow:
+ *   p = sum of sale MARGINS this year: for every sale, money received minus
+ *       what those exact units cost you (their average cost basis). Losing
+ *       sales are negative. Buying stock or ingredients does NOT touch the
+ *       ledger, because the cost is charged when the units are sold.
+ *   l = LOSSES this year: anything taken from you, valued at what it cost you
+ *       (stock and lab batches at cost basis, cash at face value). See xpLoss.
+ *   c = shortfall CARRIED from earlier years (a year whose losses beat its
+ *       profit hands the rest on, so a loss can never be dodged by timing).
+ *   v = ledger format (2). An older save's cash-flow tracker {i,o} cannot be
+ *       converted (it never recorded what unsold stock cost), so it is
+ *       replaced by an empty ledger once, the first time it is read.
+ * @returns {{p:number,l:number,c:number,v:number}} The live ledger.
  */
-function yp(){return S.yp||(S.yp={i:0,o:0})}
+function yp(){if(!S.yp||S.yp.v!==2)S.yp={p:0,l:0,c:0,v:2};return S.yp}
 
 /**
- * Converts this year's trading profit into XP, then resets the tracker.
- * Called at every year turn and when jailed.
+ * Books a LOSS against this year's XP ledger. Called by every way stock,
+ * batches or cash can be taken: muggings and burglaries, stop and search
+ * (stock and fine), stock ditched while running from police, confiscation on
+ * arrest, crew busts, raid seizures, the FBI fine, and eviction. Guns, labs
+ * and equipment are not trading stock, so they are never booked here.
+ * @param {number} v - Value lost in pounds (cost basis for goods, face value for cash).
+ * @returns {void}
+ */
+function xpLoss(v){if(v>0)yp().l+=v}
+
+/**
+ * Converts this year's ledger into XP, then opens a new ledger.
+ * Called at every year turn and when jailed (before the time jump).
  * MATH (step by step):
- *   1. net     = money in - money out (this year's trading profit).
+ *   1. net     = margins - losses - carried shortfall.
  *   2. cost    = XPD * level^XPK   -> "profit needed per XP" grows with level
  *                (XPD=1.2649, XPK=1.965), so high levels need far more profit.
  *   3. XP      = floor( sqrt(net) / cost )
@@ -905,11 +927,24 @@ function yp(){return S.yp||(S.yp={i:0,o:0})}
  *                returns): 4x the profit only gives 2x the XP.
  *   4. +1e-9   guards against floating-point error (e.g. 24.99999999 instead
  *                of 25 would otherwise floor down by one).
+ *   5. If net <= 0 no XP is paid and -net is CARRIED into next year's ledger
+ *      (c). WHY: XP is a square root, so splitting gains and losses into
+ *      separate years would otherwise pay more XP than the same trades in one
+ *      year (a loss year simply "disappeared" at zero). Carrying the shortfall
+ *      makes every pound lost count exactly once, whenever it happens. It also
+ *      catches losses booked after the year-turn XP payout (e.g. a night-time
+ *      robbery or a year-end arrest), which land in the following year.
  * EXAMPLE: level 1, net 1,000 -> sqrt = 31.62 / 1.2649 = 25.0 XP.
- * A year with a loss, or no trading, earns nothing.
  * @returns {void}
  */
-function yearXp(){var p=yp(),net=p.i-p.o;S.yp={i:0,o:0};if(!p.i&&!p.o)return;var x=net>0?Math.floor(Math.sqrt(net)/(XPD*Math.pow(lvl(),XPK))+1e-9):0;if(x>0){say('Net trading profit this year: '+gbp(net)+'. That earned you '+x+' XP.');gainXp(x)}else say('No net trading profit this year, so no XP.')}
+function yearXp(){var p=yp(),net=p.p-p.l-p.c;if(!p.p&&!p.l&&!p.c)return;
+/* Plain-English breakdown, only listing parts that are non-zero. */
+var why=gbp(p.p)+' made on sales'+(p.l?', minus '+gbp(p.l)+' taken in thefts, police action and raids':'')+(p.c?', minus '+gbp(p.c)+' carried over from earlier losses':'');
+var x=net>0?Math.floor(Math.sqrt(net)/(XPD*Math.pow(lvl(),XPK))+1e-9):0;
+S.yp={p:0,l:0,c:net<0?-net:0,v:2};/* new ledger; a shortfall rolls forward */
+if(x>0){say('Trading profit this year: '+why+' = '+gbp(net)+'. That earned you '+x+' XP.');gainXp(x)}
+else if(net>0)say('Trading profit this year: '+why+' = '+gbp(net)+'. Not quite enough for 1 XP at this level.');
+else say('No trading profit this year ('+why+'), so no XP.'+(net<0?' The '+gbp(-net)+' shortfall carries into next year.':''))}
 
 /**
  * Adds XP and shows a popup listing new unlocks if a level was gained
@@ -933,7 +968,9 @@ return '<div class="card" style="padding:8px 12px"><b>Level '+l+' \u00b7 '+lvlNa
  * ========================================================================== */
 /* Your own trades move prices. S.fat[districtIndex][drugId] is a MULTIPLIER
  * (1 = normal). Buying multiplies it up, selling multiplies it down, and it
- * relaxes back toward 1 each year. This stops buy-sell loops being profitable. */
+ * relaxes back toward 1 each year. It only ever works AGAINST you: buyAt uses
+ * max(fatigue, 1) and sellAt uses min(fatigue, 1), so no buy-sell loop (in
+ * one visit, across visits or across years) can profit from your own moves. */
 
 /**
  * Reads the fatigue multiplier for a drug in a district.
@@ -1063,13 +1100,15 @@ function pc(p){return Math.round(p*100)+'%'}
 
 /**
  * Applies a robbery loss: takes a fraction of POCKET cash only (the bank and
- * safe are untouched), counts the stat, and shows a popup.
+ * safe are untouched), counts the stat, books the cash as an XP loss and
+ * shows a popup. A night-time robbery resolves after the year's XP payout,
+ * so it lands in the following year's ledger.
  * @param {number} f - Fraction of cash lost (0..1).
  * @param {string} t - Popup title.
  * @param {number} [h] - Health lost, for the message only (applied by the caller).
  * @returns {void}
  */
-function lose(f,t,h){var l=Math.round(S.cash*f);S.cash-=l;stat().rob++;note(t,'You were robbed of '+gbp(l)+(h?' and lost '+h+' health':'')+'.')}
+function lose(f,t,h){var l=Math.round(S.cash*f);S.cash-=l;xpLoss(l);stat().rob++;note(t,'You were robbed of '+gbp(l)+(h?' and lost '+h+' health':'')+'.')}
 
 /**
  * Raises a mugging/burglary choice popup with three options:
@@ -1191,21 +1230,25 @@ function standDown(i){S.fam[i].task=null;render()}
  *  - A relative whose property is gone (sold or evicted) is stood down.
  *  - COOK: needs a lab, that drug's equipment and no batch already running.
  *    quantity n = min(10, free room, affordable) where each unit costs
- *    ingredients * 1.15 (the 15% family fee). Batch is queued as a normal batch.
+ *    ingredients * 1.15 (the 15% family fee). Batch is queued as a normal
+ *    batch whose cost basis u INCLUDES the fee, so the fee counts as a cost
+ *    against the XP margin when the units are sold.
  *  - SELL: up to 10 units from that safe. BUST CHANCE = 8% * that district's
  *    heat * (1 - bribe cut) (the `pick()*100<...` compares a 0..100 number to a
- *    percentage). Bust = lose the units and 2-4 years jail.
+ *    percentage). Bust = lose the units (booked as an XP loss at the safe's
+ *    cost basis) and 2-4 years jail.
  *    REVENUE: price = average(lo,hi) * district bias * random(0.85..1.15);
  *    pay = units * price * 0.85 (15% cut to the family).
+ *    XP margin = pay - units * safe cost basis (sp), so the seller's cut is a cost.
  * @returns {void}
  */
 function crewYear(){var out=[];if(!S.fam)return;
 S.fam.forEach(function(r){if(r.jail>0){r.jail--;if(!r.jail)out.push(r.n+' is out of jail.');return}
 var t=r.task;if(!t)return;var p=PA(t.p);if(!p){r.task=null;out.push(r.n+' has no property to work at and stood down.');return}var g=gd(t.d),wh=' in '+AREAS[p.loc].n;
-if(t.k==='cook'){if(!p.lab||!(p.eq&&p.eq[t.d])||(p.batch&&p.batch[t.d]))return;var u=ing(g),n=Math.min(10,room(p),Math.floor(S.cash/(u*1.15)));if(n<1){out.push(r.n+' couldn\u2019t start '+g.n+wh+': no space or cash.');return}var cost=Math.round(u*n*1.15);S.cash-=cost;yp().o+=cost;(p.batch=p.batch||{})[t.d]={n:n,u:u,c:1};out.push(r.n+' started '+n+' '+g.n+wh+' for '+gbp(cost)+'.')}
-else{var sf=p.safe||{},q=Math.min(10,sf[t.d]||0);if(q<1)return;
-if(pick()*100<8*AREAS[p.loc].heat*(1-(S.bribe?PROT[S.bribe.l].cut:0))){sf[t.d]-=q;r.jail=2+Math.floor(Math.random()*3);r.task=null;out.push(r.n+' was busted selling '+g.n+wh+' and lost '+q+' units. Jailed for '+r.jail+' years.');return}
-var pr=Math.round((g.lo+g.hi)/2*AREAS[p.loc].b[t.d]*rnd(.85,1.15)),rev=Math.round(q*pr*.85);sf[t.d]-=q;S.cash+=rev;yp().i+=rev;stat().sold+=q;out.push(r.n+' sold '+q+' '+g.n+wh+' for '+gbp(rev)+'.')}});
+if(t.k==='cook'){if(!p.lab||!(p.eq&&p.eq[t.d])||(p.batch&&p.batch[t.d]))return;var u=ing(g),n=Math.min(10,room(p),Math.floor(S.cash/(u*1.15)));if(n<1){out.push(r.n+' couldn\u2019t start '+g.n+wh+': no space or cash.');return}var cost=Math.round(u*n*1.15);S.cash-=cost;(p.batch=p.batch||{})[t.d]={n:n,u:cost/n,c:1};/* u = per-unit cost incl. the 15% fee */out.push(r.n+' started '+n+' '+g.n+wh+' for '+gbp(cost)+'.')}
+else{var sf=p.safe||{},sp=p.sp=p.sp||{},cb=sp[t.d]||0,q=Math.min(10,sf[t.d]||0);if(q<1)return;
+if(pick()*100<8*AREAS[p.loc].heat*(1-(S.bribe?PROT[S.bribe.l].cut:0))){xpLoss(q*cb);sf[t.d]-=q;if(!sf[t.d])sp[t.d]=0;r.jail=2+Math.floor(Math.random()*3);r.task=null;out.push(r.n+' was busted selling '+g.n+wh+' and lost '+q+' units. Jailed for '+r.jail+' years.');return}
+var pr=Math.round((g.lo+g.hi)/2*AREAS[p.loc].b[t.d]*rnd(.85,1.15)),rev=Math.round(q*pr*.85);sf[t.d]-=q;if(!sf[t.d])sp[t.d]=0;S.cash+=rev;yp().p+=rev-q*cb;stat().sold+=q;out.push(r.n+' sold '+q+' '+g.n+wh+' for '+gbp(rev)+'.')}});
 if(out.length)note('Crew report',out.join('<br>'))}
 
 
@@ -1247,7 +1290,8 @@ function newGame(){Q=[];var sn=famName(),GG=Math.random()<.5?'M':'F';S={day:1,ge
  * ROLLS TODAY'S PRICES for the current district. Called on new year,
  * travel and dev "reroll".
  * MATH, per drug:
- *   price = random(lo..hi) * district bias * market fatigue
+ *   base  = random(lo..hi) * district bias        (stored in S.base)
+ *   price = base * market fatigue                    (stored in S.prices)
  *   then a random event on a single roll r:
  *     r < 0.10        -> x 2.2  "spike"  (flag = +1)
  *     0.10 <= r < 0.20 -> x 0.4  "cheap"  (flag = -1)
@@ -1255,7 +1299,9 @@ function newGame(){Q=[];var sn=famName(),GG=Math.random()<.5?'M':'F';S={day:1,ge
  * Max(1, round(...)) guarantees a price of at least £1, as a whole number.
  * @returns {void}
  */
-function roll(){S.prices={};S.flag={};S.mk={};/* new board = new visit: forget the pre-trade prices of the last one */var a=AREAS[S.loc];GOODS.forEach(function(g){var p=rnd(g.lo,g.hi)*a.b[g.id]*fatOf(S.loc,g.id),r=pick();if(r<.1){p*=2.2;S.flag[g.id]=1}else if(r<.2){p*=.4;S.flag[g.id]=-1}S.prices[g.id]=Math.max(1,Math.round(p))})}
+function roll(){S.prices={};S.flag={};S.base={};delete S.mk;/* mk = the pre-0.53 per-visit guard, replaced by base */var a=AREAS[S.loc];GOODS.forEach(function(g){var p=rnd(g.lo,g.hi)*a.b[g.id],r=pick();if(r<.1){p*=2.2;S.flag[g.id]=1}else if(r<.2){p*=.4;S.flag[g.id]=-1}
+/* base = this board's price with NO fatigue; the market price is base * fatigue. */
+S.base[g.id]=p;S.prices[g.id]=Math.max(1,Math.round(p*fatOf(S.loc,g.id)))})}
 
 /**
  * Adds a line to the top of the history log, stamped with the current age.
@@ -1418,40 +1464,51 @@ if(!s.props){s.props=s.prop?[s.prop]:[]}delete s.prop;(s.fam||[]).forEach(functi
 function tab(t){S.tab=t;render()}
 
 /**
- * Per-drug record of this visit's PRE-TRADE prices, created on first use.
- *   .b = the price just before your FIRST buy of this drug this visit.
- *   .s = the price just before your FIRST sell of this drug this visit.
- * WHY: purchases are now charged at one flat price for the whole batch, so
- * without a guard you could Buy max (pushing the price up ~1.65x) and then
- * Sell max straight back into the price YOU inflated, at a profit, forever.
- * Capping the sell price at .b (and flooring the buy price at .s) means your
- * own trades can never be traded against in the same visit. roll() wipes S.mk,
- * so a new district or a new year starts clean and genuine "buy here, sell
- * there" trading is unaffected.
+ * This board's price for a drug BEFORE market fatigue.
+ * Normally read from S.base (written by roll). A save from before v0.53 has no
+ * S.base, so it is rebuilt from the market price: base = price / fatigue.
  * @param {string} id - Drug id.
- * @returns {{b:(number|undefined), s:(number|undefined)}}
+ * @returns {number} Unrounded base price.
  */
-function mk(id){S.mk=S.mk||{};return S.mk[id]||(S.mk[id]={})}
+function baseOf(id){return S.base&&S.base[id]!=null?S.base[id]:S.prices[id]/fatOf(S.loc,id)}
 
 /**
  * The whole-pound price you PAY per unit right now (what the Buy buttons use).
- * RULE: the market price, but never below the price before you started
- * selling this drug here this visit (.s), so selling to crash the price and
- * buying back cheap doesn't work. Rounded because the board shows whole pounds
- * and the player must be charged exactly what is shown; never below £1.
+ * RULE: base * max(fatigue, 1).
+ * WHY: fatigue is YOUR footprint on this district. Above 1 (you bought here)
+ * it makes your next purchases dearer, as intended. Below 1 (you sold here)
+ * it would let you buy back cheaply from a market you crashed yourself, so
+ * for buying it is floored at 1: your own selling never discounts your buying.
+ * This holds across visits and across years, which is what closes every
+ * round-trip loop (same visit, hop away and back, or wait a year).
+ * Rounded because the board shows whole pounds; never below £1.
  * @param {string} id - Drug id.
  * @returns {number} Unit buy price in whole pounds.
  */
-function buyAt(id){var p=S.prices[id],s=S.mk&&S.mk[id]?S.mk[id].s:undefined;return Math.max(1,Math.round(s!=null?Math.max(p,s):p))}
+function buyAt(id){return Math.max(1,Math.round(baseOf(id)*Math.max(fatOf(S.loc,id),1)))}
 
 /**
  * The whole-pound price you RECEIVE per unit right now (what Sell buttons use).
- * RULE: the market price, but never above the price before you started buying
- * this drug here this visit (.b), so your own buying can't pump your own sale.
+ * RULE: base * min(fatigue, 1), the mirror of buyAt: your own buying never
+ * lifts your own selling price, while your selling still depresses it.
+ * CONSEQUENCE: on any one board, sellAt <= buyAt always, and across boards the
+ * only thing left to profit from is the random roll and district bias, i.e.
+ * genuine "buy cheap here, sell dear there" trading.
  * @param {string} id - Drug id.
  * @returns {number} Unit sell price in whole pounds.
  */
-function sellAt(id){var p=S.prices[id],b=S.mk&&S.mk[id]?S.mk[id].b:undefined;return Math.max(1,Math.round(b!=null?Math.min(p,b):p))}
+function sellAt(id){return Math.max(1,Math.round(baseOf(id)*Math.min(fatOf(S.loc,id),1)))}
+
+/**
+ * Moves a district's fatigue for a drug and keeps the market price in step.
+ * The multiplier is applied to fatigue first (which fatSet clamps to
+ * 0.25..4), then the market price is recomputed as base * fatigue, so price
+ * and fatigue can never drift apart when the clamp bites.
+ * @param {string} id - Drug id (in the current district).
+ * @param {number} k - Multiplier (>1 after buying, <1 after selling).
+ * @returns {void}
+ */
+function pushMarket(id,k){fatSet(S.loc,id,fatOf(S.loc,id)*k);S.prices[id]=Math.max(1,baseOf(id)*fatOf(S.loc,id))}
 
 /**
  * BUYS units of a drug at ONE FLAT PRICE for the whole purchase, then applies
@@ -1464,26 +1521,24 @@ function sellAt(id){var p=S.prices[id],b=S.mk&&S.mk[id]?S.mk[id].b:undefined;ret
  *   m = min(n, free pocket room, floor(cash / u))   units actually bought.
  *   paid = m * u           every unit costs the same.
  *   r = e^(KB / cap)       per-unit fatigue factor. KB = 0.5, so m = a full
- *                          bag multiplies the price by e^0.5 (about 1.65x);
+ *                          bag multiplies fatigue by e^0.5 (about 1.65x);
  *                          dividing by cap spreads the same pressure over a
  *                          bigger bag. Total factor = r^m (exponents add, so
  *                          ten 1-unit buys and one 10-unit buy end at exactly
- *                          the same price: the anti-XP-farming effect is kept).
- *   new market price = old price * r^m (kept unrounded so many tiny
- *                          buys of a cheap drug still add up).
+ *                          the same price).
  *   new average paid = (oldAvg * oldQty + paid) / (oldQty + m)  (weighted mean)
- *   District fatigue is multiplied by r^m and cools year by year (coolMarkets).
- * Before the first buy this visit, the pre-buy price is stored in mk(id).b
- * (see sellAt). Also adds the spend to this year's "money out" for XP.
+ *                          This is the COST BASIS that sell() charges against
+ *                          the sale, so it is what XP is measured from.
+ * XP: buying books nothing. The spend is counted when the units are sold
+ * (or lost), so holding stock over the year end no longer costs XP.
  * @param {string} id - Drug id.
  * @param {number} n - Units wanted (1 for "Buy 1", a huge number for "Buy max").
  * @returns {void} (does nothing if not even one unit can be bought)
  */
 function buy(id,n){var u=buyAt(id),m=Math.min(n,cap()-carried(),Math.floor(S.cash/u));if(m<1)return;
-var k=mk(id);if(k.b==null)k.b=S.prices[id];/* remember the untouched price before our own buying moves it */
-var paid=m*u,q=S.inv[id],f=Math.pow(Math.exp(KB/cap()),m);/* f = r^m, the combined fatigue of all m units */
-S.paid[id]=(S.paid[id]*q+paid)/(q+m);S.inv[id]+=m;S.cash-=paid;yp().o+=paid;
-fatSet(S.loc,id,fatOf(S.loc,id)*f);S.prices[id]=Math.max(1,S.prices[id]*f);
+var paid=m*u,q=S.inv[id];
+S.paid[id]=(S.paid[id]*q+paid)/(q+m);S.inv[id]+=m;S.cash-=paid;
+pushMarket(id,Math.pow(Math.exp(KB/cap()),m));/* r^m: the combined fatigue of all m units */
 say('Bought '+m+' '+id+' at '+gbp(u)+' each for '+gbp(paid)+'.');render()}
 
 /**
@@ -1493,24 +1548,19 @@ say('Bought '+m+' '+id+' at '+gbp(u)+' each for '+gbp(paid)+'.');render()}
  *   m = n units ("Sell 1") or everything held ("Sell max", n omitted).
  *   u = sellAt(id)         the whole-pound price shown on the button row.
  *   total = m * u          every unit sells at the shown price.
- *   profit = total - m * average price paid (the average is unchanged by a
+ *   margin = total - m * average price paid (the average is unchanged by a
  *            partial sale; it resets to 0 when the stack is gone).
- *   d = e^(-KS / cap)      per-unit fall (KS = 0.7, so a full bag cuts the
- *                          price to e^-0.7, about 0.50x). Combined fall d^m.
- *   new price = max(£1, old * d^m); fatigue is scaled by new/old, i.e. exactly
- *   how far this sale moved the market, then cools over the years.
- * Before the first sell this visit, the pre-sell price is stored in mk(id).s
- * (see buyAt). Updates yearly "money in", lifetime units sold, and logs the
- * profit or loss.
+ *   d = e^(-KS / cap)      per-unit fall (KS = 0.7, so a full bag cuts
+ *                          fatigue to e^-0.7, about 0.50x). Combined fall d^m.
+ * XP: the MARGIN (not the takings) goes into this year's ledger, so only
+ * real profit earns XP and a losing sale counts against it.
  * @param {string} id - Drug id.
  * @param {number} [n] - Units to sell; omit to sell the whole stack.
  * @returns {void}
  */
 function sell(id,n){var q=S.inv[id];if(!q)return;var m=Math.min(n||q,q),u=sellAt(id),t=m*u,pr=t-m*S.paid[id];
-var k=mk(id);if(k.s==null)k.s=S.prices[id];/* remember the untouched price before our own selling moves it */
-var p0=S.prices[id],x=Math.max(1,p0*Math.pow(Math.exp(-KS/cap()),m));
-S.cash+=t;yp().i+=t;S.inv[id]-=m;if(!S.inv[id])S.paid[id]=0;
-fatSet(S.loc,id,fatOf(S.loc,id)*x/p0);S.prices[id]=x;
+S.cash+=t;yp().p+=pr;S.inv[id]-=m;if(!S.inv[id])S.paid[id]=0;
+pushMarket(id,Math.pow(Math.exp(-KS/cap()),m));
 say('Sold '+m+' '+id+' at '+gbp(u)+' each for '+gbp(t)+(pr>=0?' (+'+gbp(pr)+' profit).':' (a loss of '+gbp(-pr)+').'));stat().sold+=m;render()}
 
 /**
@@ -1590,7 +1640,8 @@ function jailDays(v){return v<1?1:clamp(1+Math.floor(v/1000),1,8)}
  * jail(), so this is a preview.
  * ODDS USED:
  *   Run   (hidden if noRun): 45% escape. Success: you drop HALF your stock
- *         (the half that is "ceil" is dropped, "floor" is kept) and lose 10 fed.
+ *         (the half that is "ceil" is dropped, "floor" is kept, and the
+ *         dropped half is booked as an XP loss at cost) and lose 10 fed.
  *   Fight : win = min(0.85, 0.35 + gun bonus). Win: -10 health, keep stock.
  *           Lose: -20 health, then jail.
  *   Give up: certain jail, but `ex - 1` so the sentence is one year shorter.
@@ -1604,7 +1655,7 @@ function jailDays(v){return v<1?1:clamp(1+Math.floor(v/1000),1,8)}
  * @returns {void}
  */
 function arrest(noRun,ex,title,desc){ex=ex||0;var v=Math.round(worth()),days=Math.min(10,jailDays(v)+ex+gunY()),c=[],bribe=Math.max(100,Math.round(S.cash*.3)),bp=ex>=3?.2:noRun?.4:.75,fp=Math.min(.85,.35+gunB()),y1=Math.max(1,days-1);
-if(!noRun)c.push({l:'Run',s:'Escape odds 45%. You drop half your stock to get clear. Fail and you\u2019re jailed.',fn:function(){if(pick()<.45){var dt=[];GOODS.forEach(function(g){var h=Math.ceil(S.inv[g.id]/2);if(h>0)dt.push(h+' '+g.n);S.inv[g.id]=Math.floor(S.inv[g.id]/2)});S.food=clamp(S.food-10,0,100);say('You ditched '+dt.join(', ')+' to get clear.');note('You got away','You ditched '+dt.join(', ')+' and got clear.')}else{say('They caught you.');jail(v,ex)}}});
+if(!noRun)c.push({l:'Run',s:'Escape odds 45%. You drop half your stock to get clear. Fail and you\u2019re jailed.',fn:function(){if(pick()<.45){var dt=[];GOODS.forEach(function(g){var h=Math.ceil(S.inv[g.id]/2);if(h>0){dt.push(h+' '+g.n);xpLoss(h*S.paid[g.id])}S.inv[g.id]=Math.floor(S.inv[g.id]/2)});S.food=clamp(S.food-10,0,100);say('You ditched '+dt.join(', ')+' to get clear.');note('You got away','You ditched '+dt.join(', ')+' and got clear.')}else{say('They caught you.');jail(v,ex)}}});
 c.push({l:'Fight',s:'Win odds '+pc(fp)+'. Win and you keep your stock. Lose and you\u2019re jailed.',k:'danger',fn:function(){if(pick()<fp){hurt(10,'a fight with police');note('You fought your way free','You kept your stock but lost 10 health.')}else{S.hp-=20;say('You lost the fight.');jail(v,ex)}}});
 c.push({l:'Give up',s:'Certain jail, but only about '+y1+' year'+(y1>1?'s':'')+'. A year less than losing.',fn:function(){say('You gave yourself up.');jail(v,ex-1)}});
 c.push({l:'Bribe '+gbp(bribe),s:'Success odds '+pc(bp)+'. Fail and you\u2019re jailed.',d:S.cash<bribe,fn:function(){if(S.cash>=bribe&&pick()<bp){S.cash-=bribe;note('The bribe worked','You paid '+gbp(bribe)+' and walked away.')}else{say('The bribe was refused.');jail(v,ex)}}});
@@ -1614,10 +1665,12 @@ ask(title||'You\u2019re under arrest',(desc?desc+' ':'')+(v?'You\u2019re carryin
  * SENTENCES the player. Time passes as a block of years.
  * STEPS:
  *  1. Sentence d = clamp(base + x + gun years, 1, 10).
- *  2. Convert this year's trading profit into XP (yearXp) before time jumps.
- *  3. Update lifetime arrest stats; list confiscated stock and its value.
+ *  2. List confiscated stock and its value; book its COST as an XP loss.
+ *  3. Convert this year's ledger into XP (yearXp) before time jumps, so the
+ *     confiscation counts in the year it happened. Update arrest stats.
  *  4. Confiscate ALL guns and ALL pocket stock/average prices (the safe is
- *     untouched: that is its purpose).
+ *     untouched: that is its purpose). Evictions while inside book their
+ *     losses into the next year's ledger.
  *  5. For each year inside: pay upkeep on every property via payUp (pocket
  *     first, then bank), totalling each source for the log; if neither can
  *     cover it the property is evicted (it leaves S.props, so later years skip it).
@@ -1630,7 +1683,8 @@ ask(title||'You\u2019re under arrest',(desc?desc+' ':'')+(v?'You\u2019re carryin
  * @param {number} x - Extra sentence years (can be -1 for "give up").
  * @returns {void}
  */
-function jail(v,x){var gi=gunI(),gy=gunY(),d=clamp(jailDays(v)+x+gy,1,10);yearXp();stat().arr++;stat().jail+=d;var up={c:0,b:0},lost=[],lv=0;GOODS.forEach(function(g){var n=S.inv[g.id];if(n){lost.push(n+' '+g.n);lv+=n*S.prices[g.id]}});S.guns=[];GOODS.forEach(function(g){S.inv[g.id]=0;S.paid[g.id]=0});
+function jail(v,x){var gi=gunI(),gy=gunY(),d=clamp(jailDays(v)+x+gy,1,10),up={c:0,b:0},lost=[],lv=0;GOODS.forEach(function(g){var n=S.inv[g.id];if(n){lost.push(n+' '+g.n);lv+=n*S.prices[g.id];xpLoss(n*S.paid[g.id])}});
+yearXp();stat().arr++;stat().jail+=d;S.guns=[];GOODS.forEach(function(g){S.inv[g.id]=0;S.paid[g.id]=0});
 var evt='';for(var i=0;i<d;i++){(S.props||[]).slice().forEach(function(p){var r=payUp(PROPS[p.i].up);if(r){up.c+=r.c;up.b+=r.b}else evt+=(evt?' ':'')+evict(p,true)})}
 S.day=Math.min(S.day+d,DAYS+1);finishBatches(false);S.hp=100;S.food=70;coolMarkets(d);roll();var cl=up.c+up.b,lt=(lost.length?'Confiscated: '+lost.join(', ')+' (about '+gbp(lv)+')':'You had no stock on you')+(cl>0?'. You also paid '+gbp(cl)+' in property upkeep while inside ('+upSrc(up)+')':'');say('Sentenced to '+d+' year'+(d>1?'s':'')+'. '+lt+'.');note('Sentenced to '+d+' year'+(d>1?'s':''),lt+(gi>=0?' and the '+GUNS[gi].n.toLowerCase()+' found on you added '+gy+' year'+(gy>1?'s':'')+' to the sentence':'')+'. You come out with full health and 70 fed.'+(evt?' '+evt:''));if(S.day>DAYS&&S.hp>0)S.view='over'}
 
@@ -1665,13 +1719,15 @@ render()}
  * INHERITANCE RULES:
  *  - Stock: take the most valuable drugs first (sort by current price,
  *    descending), half of each stack (rounded UP) until the heir's pockets
- *    (`left` = cap()) are full. Average prices travel with the stock.
+ *    (`left` = cap()) are full. Average prices travel with the stock (and
+ *    safes keep their sp), so the heir's XP counts only the MARGIN on
+ *    inherited stock, not its full sale value.
  *  - Cash and bank: floor(half) of each.
  *  - Kept as-is: property, bag, XP/level, generation +1 etc., family surname,
  *    relatives (nextFam), life record appended to the family line.
  *  - Property safe stock: halved (rounded up) in place.
  *  - NOT carried over: guns (reset to none), bribes, market fatigue, casino
- *    plays, yearly profit tracker, lifetime stats (reset).
+ *    plays, yearly XP ledger and any carried shortfall, lifetime stats (reset).
  * The heir starts at day 1 with 100 health and 70 fed, a new random name
  * (temporary until confirmHeir) and a face from heirLook(). View becomes
  * 'heirname'. The new log starts with ONE inheritance entry (heirLog): it is
@@ -1735,11 +1791,13 @@ function buyProp(i){var d=PROPS[i];if(blocked(i))return;var old=P(),credit=old?M
  * message, removes the property from S.props, stands down any crew assigned
  * there, logs it and returns the text so callers can also show it in a popup.
  * Your other properties are unaffected.
+ * XP: the safe stock (at its cost basis) and every batch (at ingredient cost)
+ * are booked as losses.
  * @param {Object} p - The property being lost.
  * @param {boolean} [jl] - True if it happened while the player was in jail.
  * @returns {string} The eviction message.
  */
-function evict(p,jl){var d=PROPS[p.i],l=[],v=0,sf=p.safe||{},bt=p.batch||{},bl=[];GOODS.forEach(function(g){var n=sf[g.id]||0;if(n){l.push(n+' '+g.n);v+=n*S.prices[g.id]}});Object.keys(bt).forEach(function(k){if(bt[k].n>0)bl.push(bt[k].n+' '+gd(k).n)});
+function evict(p,jl){var d=PROPS[p.i],l=[],v=0,sf=p.safe||{},sp=p.sp||{},bt=p.batch||{},bl=[];GOODS.forEach(function(g){var n=sf[g.id]||0;if(n){l.push(n+' '+g.n);v+=n*S.prices[g.id];xpLoss(n*(sp[g.id]||0))}});Object.keys(bt).forEach(function(k){if(bt[k].n>0){bl.push(bt[k].n+' '+gd(k).n);xpLoss(bt[k].n*bt[k].u)}});
 var t='You were evicted from your '+d.n.toLowerCase()+' in '+AREAS[p.loc].n+' for unpaid upkeep'+(jl?' while you were inside':'')+'. '+(l.length?'You lost everything in the safe: '+l.join(', ')+' (about '+gbp(v)+')':'The safe was empty')+(bl.length?', plus the batches cooking in your lab: '+bl.join(', '):'')+(p.lab?', and your lab and equipment':'')+'.';S.props=S.props.filter(function(x){return x!==p});dropCrew(p.loc);say(t);return t}
 
 /**
@@ -1876,11 +1934,12 @@ function raidPct(k){return heat(k,true)}
 
 /**
  * TIER 1: stop and search. Clean = nothing happens. Otherwise police take
- * ceil(30%) of every drug stack and fine 3% of pocket cash.
+ * ceil(30%) of every drug stack and fine 3% of pocket cash. The stock (at
+ * cost basis) and the fine are both booked as XP losses.
  * @returns {void}
  */
 function searched(){var c=carried();if(c<1){say('Police stopped and searched you. You were clean.');return}
-var fine=Math.round(S.cash*.03),tk=[];GOODS.forEach(function(g){var t=Math.ceil(S.inv[g.id]*.3);if(t>0)tk.push(t+' '+g.n);S.inv[g.id]-=t;if(!S.inv[g.id])S.paid[g.id]=0});S.cash-=fine;say('Stopped and searched. They took '+tk.join(', ')+' and fined you '+gbp(fine)+'.');note('Stopped and searched','They took '+tk.join(', ')+' and fined you '+gbp(fine)+'.')}
+var fine=Math.round(S.cash*.03),tk=[];xpLoss(fine);GOODS.forEach(function(g){var t=Math.ceil(S.inv[g.id]*.3);if(t>0){tk.push(t+' '+g.n);xpLoss(t*S.paid[g.id])}S.inv[g.id]-=t;if(!S.inv[g.id])S.paid[g.id]=0});S.cash-=fine;say('Stopped and searched. They took '+tk.join(', ')+' and fined you '+gbp(fine)+'.');note('Stopped and searched','They took '+tk.join(', ')+' and fined you '+gbp(fine)+'.')}
 
 /**
  * TIER 2: pulled over. Clean = waved on. Carrying stock = arrest popup
@@ -1891,11 +1950,12 @@ function stopped(){if(carried()<1){say('Pulled over and searched. They found not
 
 /**
  * Seizes every RUNNING lab batch at one property (batches already finished and
- * "waiting" for room are not touched).
+ * "waiting" for room are not touched). Each seized batch is booked as an XP
+ * loss at its ingredient cost (crew batches include the 15% fee).
  * @param {Object|null} p - The property being raided.
  * @returns {number} How many batches were seized.
  */
-function seize(p){var n=0;if(p&&p.batch)Object.keys(p.batch).forEach(function(id){if(!p.batch[id].w){delete p.batch[id];n++}});return n}
+function seize(p){var n=0;if(p&&p.batch)Object.keys(p.batch).forEach(function(id){var b=p.batch[id];if(!b.w){xpLoss(b.n*b.u);delete p.batch[id];n++}});return n}
 
 /**
  * Chooses which property a raid hits: the one with the MOST batches cooking
@@ -1928,11 +1988,12 @@ function policeRaid(){var p=raidTarget(),n=seize(p),w=p?' at your '+PROPS[p.i].n
 
 /**
  * TIER 5: FBI raid on the raid target property. Seizes its batches, DESTROYS
- * its lab and equipment, fines 25% of cash, and arrests you with +3 extra
- * years and no escape. Your other properties keep their labs.
+ * its lab and equipment, fines 25% of cash (booked as an XP loss), and
+ * arrests you with +3 extra years and no escape. Your other properties keep
+ * their labs.
  * @returns {void}
  */
-function fbi(){var p=raidTarget(),n=seize(p),fine=Math.round(S.cash*.25),lab=p&&p.lab;S.cash-=fine;if(p){p.lab=false;p.eq={}}
+function fbi(){var p=raidTarget(),n=seize(p),fine=Math.round(S.cash*.25),lab=p&&p.lab;S.cash-=fine;xpLoss(fine);if(p){p.lab=false;p.eq={}}
 note('FBI raid!',(p?'They hit your '+PROPS[p.i].n.toLowerCase()+' in '+AREAS[p.loc].n+'. ':'')+(n?'They seized '+n+' batch'+(n>1?'es':'')+', ':'')+(lab?'wrecked your lab and equipment, ':'')+'and fined you '+gbp(fine)+'.');arrest(true,3)}
 
 /**
@@ -2206,7 +2267,8 @@ function buyEq(id){var g=gd(id);S.cash-=g.eq;(P().eq=P().eq||{})[id]=1;say('You 
  * QUANTITY: m = min(requested, free room, units you can afford). If that is
  * less than asked (and the ask wasn't the "Max" 9999), a popup explains
  * which limit applied: room if room < affordable, otherwise cash.
- * Money spent counts as "money out" for the yearly XP profit.
+ * XP: nothing is booked now. The batch carries its ingredient cost (u) as
+ * the cost basis of its units, charged when they are sold or lost.
  * @param {string} id - Drug id.
  * @param {number} n - Units requested (9999 = Max).
  * @returns {void}
@@ -2214,7 +2276,7 @@ function buyEq(id){var g=gd(id);S.cash-=g.eq;(P().eq=P().eq||{})[id]=1;say('You 
 function cook(id,n){var g=gd(id),u=ing(g),p=P(),b=p.batch=p.batch||{};if(b[id])return;var r=room(),af=Math.floor(S.cash/u),m=Math.min(n,r,af);
 if(m<1){note('Can\u2019t cook '+g.n,r<1?'There\u2019s no space left in your safe or pockets.':'You can\u2019t afford the ingredients ('+gbp(u)+' each).');return}
 if(m<n&&n<9999)note('Smaller batch than asked','You asked for '+n+' '+g.n+' but only '+m+' were started: '+(r<af?'there\u2019s only room for '+r+' (safe and pockets, minus running batches).':'you can only afford ingredients for '+af+'.'));
-S.cash-=u*m;yp().o+=u*m;b[id]={n:m,u:u};say('Started cooking '+m+' '+g.n+' for '+gbp(u*m)+'. It will be ready next year.');render()}
+S.cash-=u*m;b[id]={n:m,u:u};say('Started cooking '+m+' '+g.n+' for '+gbp(u*m)+'. It will be ready next year.');render()}
 
 /**
  * Builds the Lab tab. STATES: no property in this district ->
@@ -2662,8 +2724,8 @@ var HELP='<p class="lead">Build a fortune across generations. Each turn is one y
 +'<p class="lead"><b>Looks.</b> Choose male or female, then shape the face: hair, hair colour, facial hair colour, eyebrows, eyes, nose, mouth, head shape, accessories and facial hair (or marks for women), with 10 options each. Skin tone, hair colour, facial hair colour and eye colour pass down every generation. Each heir keeps two random features from their parent, and the rest change.</p>'
 +'<p class="lead"><b>Crew.</b> Relatives can work for you once you have a property. Each relative works at one property, which you choose by assigning them while you are in that district. Cooks start a batch every year for a 15% fee on ingredients. Sellers sell up to 10 units a year from your safe for a 15% cut. They can be arrested, which takes them out for a few years.</p>'
 +'<p class="lead"><b>Bags.</b> Buy a bag in the Gear tab for more pocket slots. Better bags unlock as you level, and they pass on to your heirs.</p>'
-+'<p class="lead"><b>Market.</b> Your trades move prices in that district. Buying pushes the price up and selling pushes it down, so buying and selling back and forth just loses you money. Buy cheap, travel and sell dear. Prices settle back toward normal as years pass.</p>'
-+'<p class="lead"><b>Levels.</b> You earn XP once a year, when you let the year pass. The game takes the money your trading brought in that year (sales and crew sales) and subtracts what you spent on stock and lab ingredients. Your XP is the square root of that profit divided by 1.2649, then divided again by your level raised to the power 1.965, so the higher your level, the more profit each XP costs. At level 1, £1,000 profit earns 25 XP. At level 20 you need about £130 million for the same 25 XP. A loss earns nothing. Each level unlocks something new: a drug, a property, someone higher up to bribe, a bigger bag or a better weapon. There are 20 levels, from Street Kid to Kingpin. You start with Weed, Shrooms and Hash, a hostel, the beat cops and a knife. Levels carry on to your heirs.</p>'
++'<p class="lead"><b>Market.</b> Your trades move prices in that district, and only ever against you. Buying pushes your buy price up and selling pushes your sell price down, and those moves last until the market settles over the coming years. Your own buying never raises what you can sell for there, and your own selling never makes it cheaper for you to buy back, so buying and selling back and forth just loses you money. Buy cheap, travel and sell dear.</p>'
++'<p class="lead"><b>Levels.</b> You earn XP once a year, when you let the year pass. XP comes from the profit you actually make on what you sell: for every sale, what you got minus what those units cost you (including lab ingredients and your crew’s 15% cut). Buying stock doesn’t count until you sell it. Anything taken from you, whether stock, lab batches or cash lost to muggers, police and raids, counts against that profit at what it cost you, and a year that ends in a loss carries the shortfall into the next. Your XP is the square root of that profit divided by 1.2649, then divided again by your level raised to the power 1.965, so the higher your level, the more profit each XP costs. At level 1, £1,000 profit earns 25 XP. At level 20 you need about £130 million for the same 25 XP. Each level unlocks something new: a drug, a property, someone higher up to bribe, a bigger bag or a better weapon. There are 20 levels, from Street Kid to Kingpin. You start with Weed, Shrooms and Hash, a hostel, the beat cops and a knife. Levels carry on to your heirs, but each heir starts with a fresh XP ledger, and inherited stock only earns XP on the margin above what it originally cost.</p>'
 +levelList()
 +'<p class="lead"><b>Guns.</b> Buy them in the Guns tab. Your best one boosts your odds in fights but adds years to your sentence if police find it.</p>'
 +'<p class="lead"><b>Bank.</b> Open the Home tab to deposit or withdraw cash. Money in the bank can’t be robbed, seized in a raid or taken by a fine, and it counts toward your net worth. Your heir inherits half.</p>'
