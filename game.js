@@ -36,7 +36,7 @@
  *  save()   S -> localStorage "tn_save" (skipped while an event is open) |
  *                                                                        |
  *  THE YEAR TURN (button "Let the year pass")                            |
- *  endDay() -> upkeep/eviction -> sleep(bed):                            |
+ *  endDay() -> upkeep (pocket, then bank) / eviction -> sleep(bed):      |
  *      robbery roll -> cold/hunger -> S.day++ -> raid(heat roll)         |
  *      -> finishBatches -> coolMarkets -> roll() new prices              |
  *      -> crewYear -> yearXp (profit -> XP -> level unlocks)             |
@@ -49,7 +49,8 @@
  *  stNew()/stLoad() -> newGame()/load() -> render().
  *
  *  KEY STATE FIELDS (S): day, gen, cash, bank, hp, food, loc, inv{}, paid{},
- *  prices{}, flag{}, prop{}, guns[], bag, xp, bribe, fat{} (market fatigue),
+ *  prices{}, flag{}, props[], guns[], bag, xp, bribe, fat{} (market fatigue),
+ *  mk{} (this visit's pre-trade prices, the anti round-trip guard),
  *  yp{} (yearly profit trackers), fam[], line[], look{}, view, tab, ev, log[]
  * ========================================================================== */
 
@@ -59,7 +60,7 @@
  * ========================================================================== */
 
 /** VERSION NUMBER: change the number on the next line each release. */
-var VERSION='0.50';
+var VERSION='0.52';
 
 /** Game-wide constants.
  *  CAP  : pocket slots with no bag.
@@ -1153,13 +1154,15 @@ function nextFam(){var G=S.gen,f=(S.fam||[]).filter(function(r){return r.g>=G});
 
 /**
  * Builds the Crew tab: one row per relative with Cook / Sell / Stand down.
- * A relative is disabled with no property or while jailed. The Cook button
- * is also disabled when there's no room (room() < 1).
+ * Crew work at a SPECIFIC property: assigning uses the property in the district
+ * you are standing in, and each row shows where that relative currently works.
+ * A relative's buttons are disabled with no property here or while jailed. The
+ * Cook button is also disabled when that property has no room (room(p) < 1).
  * @returns {string} HTML.
  */
-function crewView(){var p=S.prop,c='<div class="card"><h2>Family crew</h2><p class="log">Relatives work for you once you own a property. Cooks start a batch of up to 10 each year for a 15% fee on ingredients. Sellers sell up to 10 units a year from your safe for a 15% cut. They can get arrested.</p>';
+function crewView(){var p=P(),c='<div class="card"><h2>Family crew</h2><p class="log">Relatives work for you at a property. Each relative works one property, so assign them while you are in that district. Cooks start a batch of up to 10 each year for a 15% fee on ingredients. Sellers sell up to 10 units a year from that property\u2019s safe for a 15% cut. They can get arrested.</p>';
 if(!S.fam||!S.fam.length)return c+'<p class="lead">No relatives to call on.</p></div>';
-return c+S.fam.map(function(r,i){var t=r.task,stt=r.jail>0?'In jail for '+r.jail+' more year'+(r.jail>1?'s':''):t?(t.k==='cook'?'Cooking ':'Selling ')+gd(t.d).n:'Free',off=(!p||r.jail>0)?' disabled':'';return '<div class="row" style="flex-wrap:wrap"><div class="nm" style="flex:1 1 100%"><b>'+r.n+'</b> \u00b7 '+relLabel(r)+'<small>'+stt+'</small></div><div class="btns" style="flex:1 1 100%"><button style="flex:1" onclick="assign('+i+',\'cook\')"'+(off||(room()<1?' disabled':''))+'>Cook'+(!off&&room()<1?' (no room)':'')+'</button><button style="flex:1" onclick="assign('+i+',\'sell\')"'+off+'>Sell</button><button style="flex:1" onclick="standDown('+i+')"'+(t?'':' disabled')+'>Stand down</button></div></div>'}).join('')+(p?'':'<p class="log">Buy a property first.</p>')+'</div>'}
+return c+S.fam.map(function(r,i){var t=r.task,stt=r.jail>0?'In jail for '+r.jail+' more year'+(r.jail>1?'s':''):t?(t.k==='cook'?'Cooking ':'Selling ')+gd(t.d).n+(AREAS[t.p]?' in '+AREAS[t.p].n:''):'Free',off=(!p||r.jail>0)?' disabled':'';return '<div class="row" style="flex-wrap:wrap"><div class="nm" style="flex:1 1 100%"><b>'+r.n+'</b> \u00b7 '+relLabel(r)+'<small>'+stt+'</small></div><div class="btns" style="flex:1 1 100%"><button style="flex:1" onclick="assign('+i+',\'cook\')"'+(off||(room(p)<1?' disabled':''))+'>Cook'+(!off&&room(p)<1?' (no room)':'')+'</button><button style="flex:1" onclick="assign('+i+',\'sell\')"'+off+'>Sell</button><button style="flex:1" onclick="standDown('+i+')"'+(t?'':' disabled')+'>Stand down</button></div></div>'}).join('')+(p?'':'<p class="log">You have no property in '+AREAS[S.loc].n+'. Go to one of your properties to assign crew there.</p>')+'</div>'}
 
 /**
  * Opens the "which drug?" picker for a relative. (go() stores the menu to
@@ -1171,35 +1174,38 @@ return c+S.fam.map(function(r,i){var t=r.task,stt=r.jail>0?'In jail for '+r.jail
 function assign(i,k){AS={i:i,k:k};go('assign')}
 
 /**
- * Confirms the picker: stores the task on the relative and closes the menu.
+ * Confirms the picker: stores the task (and the district, p, of the property it runs at) on the relative and closes the menu.
  * @param {string} id - Drug id.
  * @returns {void}
  */
-function setTask(id){S.fam[AS.i].task={k:AS.k,d:id};M=null;render()}
+function setTask(id){S.fam[AS.i].task={k:AS.k,d:id,p:S.loc};M=null;render()}
 
 /** Cancels a relative's task. @param {number} i - Relative index. @returns {void} */
 function standDown(i){S.fam[i].task=null;render()}
 
 /**
  * Runs every relative's job at the year turn and reports results in one popup.
+ * Each task runs at the property in the district stored in task.p, using THAT
+ * property's lab, equipment, safe and room.
  *  - Jailed relatives count down one year.
+ *  - A relative whose property is gone (sold or evicted) is stood down.
  *  - COOK: needs a lab, that drug's equipment and no batch already running.
  *    quantity n = min(10, free room, affordable) where each unit costs
  *    ingredients * 1.15 (the 15% family fee). Batch is queued as a normal batch.
- *  - SELL: up to 10 units from the safe. BUST CHANCE = 8% * district heat *
- *    (1 - bribe cut) (the `pick()*100<...` compares a 0..100 number to a
+ *  - SELL: up to 10 units from that safe. BUST CHANCE = 8% * that district's
+ *    heat * (1 - bribe cut) (the `pick()*100<...` compares a 0..100 number to a
  *    percentage). Bust = lose the units and 2-4 years jail.
  *    REVENUE: price = average(lo,hi) * district bias * random(0.85..1.15);
  *    pay = units * price * 0.85 (15% cut to the family).
  * @returns {void}
  */
-function crewYear(){var p=S.prop,out=[];if(!S.fam)return;
+function crewYear(){var out=[];if(!S.fam)return;
 S.fam.forEach(function(r){if(r.jail>0){r.jail--;if(!r.jail)out.push(r.n+' is out of jail.');return}
-var t=r.task;if(!t||!p)return;var g=gd(t.d);
-if(t.k==='cook'){if(!p.lab||!(p.eq&&p.eq[t.d])||(p.batch&&p.batch[t.d]))return;var u=ing(g),n=Math.min(10,room(),Math.floor(S.cash/(u*1.15)));if(n<1){out.push(r.n+' couldn\u2019t start '+g.n+': no space or cash.');return}var cost=Math.round(u*n*1.15);S.cash-=cost;yp().o+=cost;(p.batch=p.batch||{})[t.d]={n:n,u:u,c:1};out.push(r.n+' started '+n+' '+g.n+' for '+gbp(cost)+'.')}
+var t=r.task;if(!t)return;var p=PA(t.p);if(!p){r.task=null;out.push(r.n+' has no property to work at and stood down.');return}var g=gd(t.d),wh=' in '+AREAS[p.loc].n;
+if(t.k==='cook'){if(!p.lab||!(p.eq&&p.eq[t.d])||(p.batch&&p.batch[t.d]))return;var u=ing(g),n=Math.min(10,room(p),Math.floor(S.cash/(u*1.15)));if(n<1){out.push(r.n+' couldn\u2019t start '+g.n+wh+': no space or cash.');return}var cost=Math.round(u*n*1.15);S.cash-=cost;yp().o+=cost;(p.batch=p.batch||{})[t.d]={n:n,u:u,c:1};out.push(r.n+' started '+n+' '+g.n+wh+' for '+gbp(cost)+'.')}
 else{var sf=p.safe||{},q=Math.min(10,sf[t.d]||0);if(q<1)return;
-if(pick()*100<8*AREAS[p.loc].heat*(1-(S.bribe?PROT[S.bribe.l].cut:0))){sf[t.d]-=q;r.jail=2+Math.floor(Math.random()*3);r.task=null;out.push(r.n+' was busted selling '+g.n+' and lost '+q+' units. Jailed for '+r.jail+' years.');return}
-var pr=Math.round((g.lo+g.hi)/2*AREAS[p.loc].b[t.d]*rnd(.85,1.15)),rev=Math.round(q*pr*.85);sf[t.d]-=q;S.cash+=rev;yp().i+=rev;stat().sold+=q;out.push(r.n+' sold '+q+' '+g.n+' for '+gbp(rev)+'.')}});
+if(pick()*100<8*AREAS[p.loc].heat*(1-(S.bribe?PROT[S.bribe.l].cut:0))){sf[t.d]-=q;r.jail=2+Math.floor(Math.random()*3);r.task=null;out.push(r.n+' was busted selling '+g.n+wh+' and lost '+q+' units. Jailed for '+r.jail+' years.');return}
+var pr=Math.round((g.lo+g.hi)/2*AREAS[p.loc].b[t.d]*rnd(.85,1.15)),rev=Math.round(q*pr*.85);sf[t.d]-=q;S.cash+=rev;yp().i+=rev;stat().sold+=q;out.push(r.n+' sold '+q+' '+g.n+wh+' for '+gbp(rev)+'.')}});
 if(out.length)note('Crew report',out.join('<br>'))}
 
 
@@ -1235,7 +1241,7 @@ return h+'<button class="main full" onclick="back()">Back</button></div>'}
  * prices and renders.
  * @returns {void}
  */
-function newGame(){Q=[];var sn=famName(),GG=Math.random()<.5?'M':'F';S={day:1,gen:1,xp:0,guns:[],bag:-1,bank:0,gender:GG,name:pickName(GG),sn:sn,fam:[mkRel('Sibling',1,sn),mkRel('Cousin',1,sn)],line:[],st:{sold:0,jail:0,arr:0,rob:0,peak:0},sex:'',cash:100,hp:100,food:70,loc:0,inv:zero(),paid:zero(),prop:null,look:newLook(GG),tab:'trade',view:'create',log:['You’re 18 with £100 and fifty years ahead of you. You’ll sleep rough until you can buy a place. Eat, and don’t get caught.'],ev:null};roll();render()}
+function newGame(){Q=[];var sn=famName(),GG=Math.random()<.5?'M':'F';S={day:1,gen:1,xp:0,guns:[],bag:-1,bank:0,gender:GG,name:pickName(GG),sn:sn,fam:[mkRel('Sibling',1,sn),mkRel('Cousin',1,sn)],line:[],st:{sold:0,jail:0,arr:0,rob:0,peak:0},sex:'',cash:100,hp:100,food:70,loc:0,inv:zero(),paid:zero(),props:[],look:newLook(GG),tab:'trade',view:'create',log:['You’re 18 with £100 and fifty years ahead of you. You’ll sleep rough until you can buy a place. Eat, and don’t get caught.'],ev:null};roll();render()}
 
 /**
  * ROLLS TODAY'S PRICES for the current district. Called on new year,
@@ -1249,7 +1255,7 @@ function newGame(){Q=[];var sn=famName(),GG=Math.random()<.5?'M':'F';S={day:1,ge
  * Max(1, round(...)) guarantees a price of at least £1, as a whole number.
  * @returns {void}
  */
-function roll(){S.prices={};S.flag={};var a=AREAS[S.loc];GOODS.forEach(function(g){var p=rnd(g.lo,g.hi)*a.b[g.id]*fatOf(S.loc,g.id),r=pick();if(r<.1){p*=2.2;S.flag[g.id]=1}else if(r<.2){p*=.4;S.flag[g.id]=-1}S.prices[g.id]=Math.max(1,Math.round(p))})}
+function roll(){S.prices={};S.flag={};S.mk={};/* new board = new visit: forget the pre-trade prices of the last one */var a=AREAS[S.loc];GOODS.forEach(function(g){var p=rnd(g.lo,g.hi)*a.b[g.id]*fatOf(S.loc,g.id),r=pick();if(r<.1){p*=2.2;S.flag[g.id]=1}else if(r<.2){p*=.4;S.flag[g.id]=-1}S.prices[g.id]=Math.max(1,Math.round(p))})}
 
 /**
  * Adds a line to the top of the history log, stamped with the current age.
@@ -1317,7 +1323,7 @@ function render(){var h='';try{stat().peak=Math.max(stat().peak,net())}catch(e){
 /* ---- DEATH SCREEN: also records a new best score to localStorage ---- */
 if(S.view==='over'){var rc=lifeRec(),sc=rc.net;if(sc>best){best=sc;try{localStorage.setItem('tn_best',best)}catch(e){}}
 var fr=function(a,b){return '<div class="row"><div class="nm">'+a+'</div><b>'+b+'</b></div>'};
-h='<div class="top"><h1>Kingpin: Bloodline</h1><div class="day">Gen '+S.gen+'</div></div><div class="card"><h2>'+rc.n+'</h2><p class="lead">'+(rc.cause==='old age'?'Died of old age':'Died of '+rc.cause)+' aged '+rc.died+' \u00b7 '+(rc.sx==='Founder'?'founder of the bloodline':rc.sx.toLowerCase()+', generation '+rc.g)+'.</p><div style="display:flex;justify-content:center">'+portrait(S.look,96)+'</div><div class="num big">'+gbp(sc)+'</div><p class="log">Net worth at death. Best on this device: '+gbp(best)+'</p>'+fr('Level reached',rc.lvl)+fr('Peak net worth',gbp(rc.peak))+fr('Units sold',rc.sold)+fr('Arrests',rc.arr+' ('+rc.jail+' years inside)')+fr('Times robbed',rc.rob)+fr('Property',S.prop?PROPS[S.prop.i].n:'None')+'<button class="full" onclick="go(\'tree\')">View family tree</button></div><div class="card"><p class="lead">Your heir inherits half the cash, half your bank balance and half the stock (as much as they can carry)'+(S.prop?', the property':'')+', your bag, your level and your crew. Who takes over?</p><div class="btns"><button class="main" style="flex:1" onclick="heir(\'Son\')">Son</button><button class="main" style="flex:1" onclick="heir(\'Daughter\')">Daughter</button></div></div>'}
+h='<div class="top"><h1>Kingpin: Bloodline</h1><div class="day">Gen '+S.gen+'</div></div><div class="card"><h2>'+rc.n+'</h2><p class="lead">'+(rc.cause==='old age'?'Died of old age':'Died of '+rc.cause)+' aged '+rc.died+' \u00b7 '+(rc.sx==='Founder'?'founder of the bloodline':rc.sx.toLowerCase()+', generation '+rc.g)+'.</p><div style="display:flex;justify-content:center">'+portrait(S.look,96)+'</div><div class="num big">'+gbp(sc)+'</div><p class="log">Net worth at death. Best on this device: '+gbp(best)+'</p>'+fr('Level reached',rc.lvl)+fr('Peak net worth',gbp(rc.peak))+fr('Units sold',rc.sold)+fr('Arrests',rc.arr+' ('+rc.jail+' years inside)')+fr('Times robbed',rc.rob)+fr('Properties',propNames())+'<button class="full" onclick="go(\'tree\')">View family tree</button></div><div class="card"><p class="lead">Your heir inherits half the cash, half your bank balance and half the stock (as much as they can carry)'+(S.props&&S.props.length?', all your properties':'')+', your bag, your level and your crew. Who takes over?</p><div class="btns"><button class="main" style="flex:1" onclick="heir(\'Son\')">Son</button><button class="main" style="flex:1" onclick="heir(\'Daughter\')">Daughter</button></div></div>'}
 /* ---- OTHER FULL-SCREEN VIEWS ---- */
 else if(S.view==='heirname'){h=heirNameView()}
 else if(S.view==='create'){h=createView()}
@@ -1326,14 +1332,19 @@ else if(S.view==='create'){h=createView()}
 else if(S.ev){h=head()+'<div class="card"><h2>'+S.ev.t+'</h2><p class="lead">'+S.ev.d+'</p>'+S.ev.c.map(function(c,i){return '<button class="opt '+(c.k||'')+'"'+(c.d?' disabled':'')+' onclick="choose('+i+')">'+c.l+(c.s?'<small>'+c.s+'</small>':'')+'</button>'}).join('')+'</div>'+logb()}
 /* ---- MAIN DAY VIEW: header + tab bar, then the card(s) of the active tab ---- */
 else{var a=AREAS[S.loc];h=head('<div class="tabs"><button class="'+(S.tab==='trade'?'on':'')+'" onclick="tab(\'trade\')">Trade</button><button class="'+(S.tab==='food'?'on':'')+'" onclick="tab(\'food\')">Care</button><button class="'+(S.tab==='go'?'on':'')+'" onclick="tab(\'go\')">Travel</button><button class="'+(S.tab==='home'?'on':'')+'" onclick="tab(\'home\')">Home</button><button class="'+(S.tab==='lab'?'on':'')+'" onclick="tab(\'lab\')">Lab</button><button class="'+(S.tab==='guns'?'on':'')+'" onclick="tab(\'guns\')">Gear</button><button class="'+(S.tab==='crew'?'on':'')+'" onclick="tab(\'crew\')">Crew</button><button class="'+(S.tab==='casino'?'on':'')+'" onclick="tab(\'casino\')">Casino</button></div>');
-/* TRADE TAB: market list. Buy/Max disabled if you can't afford one unit or pockets are full; "Sell all" disabled with nothing held. Spike/cheap tags come from S.flag. */
-if(S.tab==='trade'){h+='<div class="card"><h2>'+a.n+' market</h2><small class="log">Pockets: '+carried()+' of '+cap()+'</small>'+ug().map(function(g){var q=S.inv[g.id],p=S.prices[g.id],f=S.flag[g.id];return '<div class="row"><div class="nm"><b>'+g.n+'</b> '+gbp(p)+(f?' <span class="'+(f>0?'up':'down')+'">'+(f>0?'spike':'cheap')+'</span>':'')+'<small>Holding '+q+(q?' · paid avg '+gbp(S.paid[g.id]):'')+'</small>'+(DEVR?'<small style="color:var(--sleet)">'+rng(g)+'</small>':'')+'</div><div class="btns"><button class="buy" onclick="buy(\''+g.id+'\',1)" '+(S.cash<Math.round(p)||carried()>=cap()?'disabled':'')+'>Buy</button><button onclick="buy(\''+g.id+'\',99)" '+(S.cash<Math.round(p)||carried()>=cap()?'disabled':'')+'>Max</button><button class="sell" onclick="sell(\''+g.id+'\')" '+(q?'':'disabled')+'>Sell all</button></div></div>'}).join('')+'</div>'}
+/* TRADE TAB: market list. Four buttons per drug in a 2x2 grid (.btns.trade):
+   Buy 1 / Buy max (disabled if you can't afford one unit at the buy price or
+   pockets are full) and Sell 1 / Sell max (disabled with nothing held).
+   Normally one price is shown. If you've already traded this drug here this
+   visit, the buy and sell prices can differ (see buyAt/sellAt), so both are
+   shown. Spike/cheap tags come from S.flag. */
+if(S.tab==='trade'){h+='<div class="card"><h2>'+a.n+' market</h2><small class="log">Pockets: '+carried()+' of '+cap()+'</small>'+ug().map(function(g){var q=S.inv[g.id],bp=buyAt(g.id),sp=sellAt(g.id),f=S.flag[g.id],no=S.cash<bp||carried()>=cap();return '<div class="row"><div class="nm"><b>'+g.n+'</b> '+(bp===sp?gbp(bp):'Buy '+gbp(bp)+' \u00b7 Sell '+gbp(sp))+(f?' <span class="'+(f>0?'up':'down')+'">'+(f>0?'spike':'cheap')+'</span>':'')+'<small>Holding '+q+(q?' \u00b7 paid avg '+gbp(S.paid[g.id]):'')+'</small>'+(DEVR?'<small style="color:var(--sleet)">'+rng(g)+'</small>':'')+'</div>'+'<div class="btns trade"><button class="buy" onclick="buy(\''+g.id+'\',1)" '+(no?'disabled':'')+'>Buy 1</button><button class="buy" onclick="buy(\''+g.id+'\',99999)" '+(no?'disabled':'')+'>Buy max</button>'+'<button class="sell" onclick="sell(\''+g.id+'\',1)" '+(q?'':'disabled')+'>Sell 1</button><button class="sell" onclick="sell(\''+g.id+'\')" '+(q?'':'disabled')+'>Sell max</button></div></div>'}).join('')+'</div>'}
 /* ODD JOBS sit under the market; CARE TAB = food and medicine cards */
 if(S.tab==='trade')h+=jobsView();if(S.tab==='food'){h+='<div class="card"><h2>Food</h2>'+FOOD.map(function(f,i){return '<div class="row"><div class="nm"><b>'+f.n+'</b> '+gbp(f.c)+'<small>+'+f.f+' fed'+(f.h?', +'+f.h+' health':'')+'</small></div><button onclick="eat('+i+')" '+(S.cash<f.c?'disabled':'')+'>Buy</button></div>'}).join('')+'<p class="log">Each year you lose 30 fed. At zero you lose 15 health. Well fed and indoors, you heal.</p></div><div class="card"><h2>Medicine</h2>'+MEDS.map(function(m,i){return '<div class="row"><div class="nm"><b>'+m.n+'</b> '+gbp(m.c)+'<small>+'+m.h+' health</small></div><button onclick="heal('+i+')" '+(S.cash<m.c||S.hp>=100?'disabled':'')+'>Buy</button></div>'}).join('')+'</div>'}
 /* TRAVEL TAB: district list with a police-presence label from heat: <0.7 light, <1.1 moderate, else heavy */
 if(S.tab==='go'){h+='<div class="card"><h2>Move to another district</h2><p class="log">Travelling costs 10 fed and risks a stop or a mugging. Busier districts mean more police.</p>'+AREAS.map(function(x,i){return '<div class="row"><div class="nm"><b>'+x.n+'</b><small>Police '+(x.heat<.7?'light':x.heat<1.1?'moderate':'heavy')+'</small></div><button onclick="travel('+i+')" '+(i===S.loc?'disabled':'')+'>'+(i===S.loc?'Here':'Go')+'</button></div>'}).join('')+'</div>'}
-/* HOME TAB: safe + bank + property list. Buying a new property needs cash PLUS the 80% resale of the one you'd replace (that's the S.cash+... check); blocked() adds level/lock rules. */
-if(S.tab==='home'){h+=safeView()+bankView()+'<div class="card"><h2>Property</h2>'+(S.prop?'<p class="lead">You own a '+PROPS[S.prop.i].n.toLowerCase()+' in '+AREAS[S.prop.loc].n+'. Upkeep '+gbp(PROPS[S.prop.i].up)+' a year. '+(S.prop.i===0?'It can\u2019t be sold, but trading up still gives you '+gbp(PROPS[0].c*.8)+' back.':'It sells for '+gbp(PROPS[S.prop.i].c*.8)+'.')+' Safe holds '+SLOTS[S.prop.i]+'.</p>'+(S.prop.lab?'<p class="log">Your lab and equipment go with the property if you sell or trade up.</p>':'')+(locked()?'<p class="log">You can’t sell while the safe has stock or a batch is running. Upgrading moves your stock to the new safe, but the lab and equipment stay behind, so let batches finish first.</p>':'')+(S.prop.i===0?'':'<button class="danger full" onclick="sellProp()"'+(locked()?' disabled':'')+'>Sell property</button>'):'<p class="lead">No place of your own, so you sleep rough: cold, and easy prey. Buy a place in '+AREAS[S.loc].n+' to sleep safely whenever you end the day here.</p>')+PROPS.map(function(p,i){return '<div class="row"><div class="nm"><b>'+p.n+'</b> '+gbp(p.c)+'<small>Upkeep '+gbp(p.up)+' a year. Safe slots: '+SLOTS[i]+'. '+(lvl()<p.u?'Unlocks at level '+p.u:p.info)+'</small></div><button onclick="buyProp('+i+')" '+(owns(i)||S.cash+(S.prop?PROPS[S.prop.i].c*.8:0)<p.c||blocked(i)?'disabled':'')+'>'+(owns(i)?'Already owned':'Buy')+'</button></div>'}).join('')+'</div>'}
+/* HOME TAB: safe + bank + this district's property card (propView). Buying here needs cash PLUS the 80% resale of the property here that you'd replace; blocked() adds the already-owned, level and lock rules. */
+if(S.tab==='home')h+=safeView()+bankView()+propView();
 /* REMAINING TABS delegate to their own builders */
 if(S.tab==='home')h+=bribeView();
 if(S.tab==='lab')h+=labView();
@@ -1387,7 +1398,9 @@ function save(){if(S.ev)return;try{localStorage.setItem('tn_save',JSON.stringify
  *   missing stats / bag / bank -> sensible defaults.
  * @returns {Object|null} A usable state object, or null if none/corrupt.
  */
-function load(){try{var j=localStorage.getItem('tn_save');if(j){var s=JSON.parse(j);if(s&&(s.v===2||s.v===3||s.v===4)&&s.inv&&s.prices&&s.day){if(s.v===2&&s.prop)s.prop.i++;if(!s.sn){s.sn=famName();s.name=pickName(Math.random()<.5?'M':'F');s.fam=[mkRel('Sibling',s.gen||1,s.sn),mkRel('Cousin',s.gen||1,s.sn)];s.line=s.line||[]}if(!s.gender)s.gender=s.sex==='Daughter'?'F':'M';s.look=fixLook(s.look,s.gender);(s.line||[]).forEach(function(r){r.look=fixLook(r.look,r.sx==='Daughter'?'F':'M')});if(!s.st)s.st={sold:0,jail:0,arr:0,rob:0,peak:0};if(s.bag==null)s.bag=-1;if(s.bank==null)s.bank=0;s.v=4;return s}}}catch(e){}return null}
+function load(){try{var j=localStorage.getItem('tn_save');if(j){var s=JSON.parse(j);if(s&&(s.v===2||s.v===3||s.v===4)&&s.inv&&s.prices&&s.day){if(s.v===2&&s.prop)s.prop.i++;
+/* MIGRATION (v0.51): older saves held a single S.prop. Move it into the S.props array, and tag crew tasks with the district they work in (or stand them down if there is none). */
+if(!s.props){s.props=s.prop?[s.prop]:[]}delete s.prop;(s.fam||[]).forEach(function(r){if(r.task&&r.task.p==null){if(s.props.length)r.task.p=s.props[0].loc;else r.task=null}});if(!s.sn){s.sn=famName();s.name=pickName(Math.random()<.5?'M':'F');s.fam=[mkRel('Sibling',s.gen||1,s.sn),mkRel('Cousin',s.gen||1,s.sn)];s.line=s.line||[]}if(!s.gender)s.gender=s.sex==='Daughter'?'F':'M';s.look=fixLook(s.look,s.gender);(s.line||[]).forEach(function(r){r.look=fixLook(r.look,r.sx==='Daughter'?'F':'M')});if(!s.st)s.st={sold:0,jail:0,arr:0,rob:0,peak:0};if(s.bag==null)s.bag=-1;if(s.bank==null)s.bank=0;s.v=4;return s}}}catch(e){}return null}
 
 /* ===================== END OF PART 3 ===================== */
 
@@ -1405,44 +1418,100 @@ function load(){try{var j=localStorage.getItem('tn_save');if(j){var s=JSON.parse
 function tab(t){S.tab=t;render()}
 
 /**
- * BUYS units of a drug, with MARKET FATIGUE: every unit you buy pushes the
- * price up a little, so the 10th unit costs more than the 1st.
- * MATH (step by step):
- *   r = e^(KB / cap)      per-unit price multiplier. KB = 0.5, so buying a
- *                         FULL bag of `cap` units multiplies the price by
- *                         e^0.5 (about 1.65x). Dividing by cap means a bigger
- *                         bag spreads the same pressure over more units.
- *   loop: each unit costs the current price x, then x *= r (next one dearer).
- *   The loop stops when: asked amount reached, pockets are full, or the next
- *   total (rounded) would exceed your cash.
- *   paid = min(cash, round(total))   total actually charged.
- *   new average price paid = (oldAverage * oldQty + totalPaid) / (oldQty + newQty)
- *                            (a weighted average, shown as "paid avg").
- *   Market fatigue for this district is multiplied by r^m, which later cools
- *   back toward 1 year by year (see coolMarkets).
- * Also adds the spend to this year's "money out" for the XP profit formula.
+ * Per-drug record of this visit's PRE-TRADE prices, created on first use.
+ *   .b = the price just before your FIRST buy of this drug this visit.
+ *   .s = the price just before your FIRST sell of this drug this visit.
+ * WHY: purchases are now charged at one flat price for the whole batch, so
+ * without a guard you could Buy max (pushing the price up ~1.65x) and then
+ * Sell max straight back into the price YOU inflated, at a profit, forever.
+ * Capping the sell price at .b (and flooring the buy price at .s) means your
+ * own trades can never be traded against in the same visit. roll() wipes S.mk,
+ * so a new district or a new year starts clean and genuine "buy here, sell
+ * there" trading is unaffected.
  * @param {string} id - Drug id.
- * @param {number} n - Units wanted (99 is used by the "Max" button).
- * @returns {void} (does nothing if not even one unit can be bought)
+ * @returns {{b:(number|undefined), s:(number|undefined)}}
  */
-function buy(id,n){var x=S.prices[id],r=Math.exp(KB/cap()),tot=0,m=0,c=carried();while(m<n&&c+m<cap()&&Math.round(tot+x)<=S.cash){tot+=x;x*=r;m++}if(m<1)return;var paid=Math.min(S.cash,Math.round(tot)),q=S.inv[id];S.paid[id]=(S.paid[id]*q+paid)/(q+m);S.inv[id]+=m;S.cash-=paid;yp().o+=paid;fatSet(S.loc,id,fatOf(S.loc,id)*Math.pow(r,m));S.prices[id]=Math.max(1,x);say('Bought '+m+' '+id+' for '+gbp(paid)+'.');render()}
+function mk(id){S.mk=S.mk||{};return S.mk[id]||(S.mk[id]={})}
 
 /**
- * SELLS ALL held units of a drug; each unit sold pushes the price DOWN.
- * MATH:
- *   d = e^(-KS / cap)     per-unit multiplier below 1 (KS = 0.7), so selling
- *                         a full bag cuts the price to e^-0.7 (about 0.50x).
- *   The first unit already sells at x*d (the loop decays BEFORE adding), so
- *   you never get the full displayed price for the whole stack.
- *   total = sum of all unit prices (floored to at least £1 each).
- *   profit = round(total) - (units * average price paid).
- *   Fatigue multiplier is scaled by (finalPrice / startPrice), i.e. exactly
- *   how far this sale dropped the market, then cools over the years.
- * Updates yearly "money in", lifetime units sold, and logs profit or loss.
+ * The whole-pound price you PAY per unit right now (what the Buy buttons use).
+ * RULE: the market price, but never below the price before you started
+ * selling this drug here this visit (.s), so selling to crash the price and
+ * buying back cheap doesn't work. Rounded because the board shows whole pounds
+ * and the player must be charged exactly what is shown; never below £1.
  * @param {string} id - Drug id.
+ * @returns {number} Unit buy price in whole pounds.
+ */
+function buyAt(id){var p=S.prices[id],s=S.mk&&S.mk[id]?S.mk[id].s:undefined;return Math.max(1,Math.round(s!=null?Math.max(p,s):p))}
+
+/**
+ * The whole-pound price you RECEIVE per unit right now (what Sell buttons use).
+ * RULE: the market price, but never above the price before you started buying
+ * this drug here this visit (.b), so your own buying can't pump your own sale.
+ * @param {string} id - Drug id.
+ * @returns {number} Unit sell price in whole pounds.
+ */
+function sellAt(id){var p=S.prices[id],b=S.mk&&S.mk[id]?S.mk[id].b:undefined;return Math.max(1,Math.round(b!=null?Math.min(p,b):p))}
+
+/**
+ * BUYS units of a drug at ONE FLAT PRICE for the whole purchase, then applies
+ * MARKET FATIGUE once the purchase is complete.
+ * WHY FLAT: "Buy max" at a shown £15 must cost exactly £15 a unit. Fatigue is
+ * still applied for every unit bought, just AFTER the purchase instead of
+ * unit by unit, so the next purchase (and the next "Buy 1") is dearer.
+ * MATH (step by step):
+ *   u = buyAt(id)          the whole-pound price shown on the button row.
+ *   m = min(n, free pocket room, floor(cash / u))   units actually bought.
+ *   paid = m * u           every unit costs the same.
+ *   r = e^(KB / cap)       per-unit fatigue factor. KB = 0.5, so m = a full
+ *                          bag multiplies the price by e^0.5 (about 1.65x);
+ *                          dividing by cap spreads the same pressure over a
+ *                          bigger bag. Total factor = r^m (exponents add, so
+ *                          ten 1-unit buys and one 10-unit buy end at exactly
+ *                          the same price: the anti-XP-farming effect is kept).
+ *   new market price = old price * r^m (kept unrounded so many tiny
+ *                          buys of a cheap drug still add up).
+ *   new average paid = (oldAvg * oldQty + paid) / (oldQty + m)  (weighted mean)
+ *   District fatigue is multiplied by r^m and cools year by year (coolMarkets).
+ * Before the first buy this visit, the pre-buy price is stored in mk(id).b
+ * (see sellAt). Also adds the spend to this year's "money out" for XP.
+ * @param {string} id - Drug id.
+ * @param {number} n - Units wanted (1 for "Buy 1", a huge number for "Buy max").
+ * @returns {void} (does nothing if not even one unit can be bought)
+ */
+function buy(id,n){var u=buyAt(id),m=Math.min(n,cap()-carried(),Math.floor(S.cash/u));if(m<1)return;
+var k=mk(id);if(k.b==null)k.b=S.prices[id];/* remember the untouched price before our own buying moves it */
+var paid=m*u,q=S.inv[id],f=Math.pow(Math.exp(KB/cap()),m);/* f = r^m, the combined fatigue of all m units */
+S.paid[id]=(S.paid[id]*q+paid)/(q+m);S.inv[id]+=m;S.cash-=paid;yp().o+=paid;
+fatSet(S.loc,id,fatOf(S.loc,id)*f);S.prices[id]=Math.max(1,S.prices[id]*f);
+say('Bought '+m+' '+id+' at '+gbp(u)+' each for '+gbp(paid)+'.');render()}
+
+/**
+ * SELLS units of a drug at ONE FLAT PRICE for the whole sale, then pushes the
+ * market price DOWN once the sale is complete.
+ * MATH:
+ *   m = n units ("Sell 1") or everything held ("Sell max", n omitted).
+ *   u = sellAt(id)         the whole-pound price shown on the button row.
+ *   total = m * u          every unit sells at the shown price.
+ *   profit = total - m * average price paid (the average is unchanged by a
+ *            partial sale; it resets to 0 when the stack is gone).
+ *   d = e^(-KS / cap)      per-unit fall (KS = 0.7, so a full bag cuts the
+ *                          price to e^-0.7, about 0.50x). Combined fall d^m.
+ *   new price = max(£1, old * d^m); fatigue is scaled by new/old, i.e. exactly
+ *   how far this sale moved the market, then cools over the years.
+ * Before the first sell this visit, the pre-sell price is stored in mk(id).s
+ * (see buyAt). Updates yearly "money in", lifetime units sold, and logs the
+ * profit or loss.
+ * @param {string} id - Drug id.
+ * @param {number} [n] - Units to sell; omit to sell the whole stack.
  * @returns {void}
  */
-function sell(id){var q=S.inv[id];if(!q)return;var p0=S.prices[id],x=p0,d=Math.exp(-KS/cap()),tot=0;for(var i=0;i<q;i++){x=Math.max(1,x*d);tot+=x}var t=Math.round(tot),pr=t-q*S.paid[id];S.cash+=t;yp().i+=t;S.inv[id]=0;S.paid[id]=0;fatSet(S.loc,id,fatOf(S.loc,id)*x/p0);S.prices[id]=x;say('Sold '+q+' '+id+' for '+gbp(t)+(pr>=0?' (+'+gbp(pr)+' profit).':' (a loss of '+gbp(-pr)+').'));stat().sold+=q;render()}
+function sell(id,n){var q=S.inv[id];if(!q)return;var m=Math.min(n||q,q),u=sellAt(id),t=m*u,pr=t-m*S.paid[id];
+var k=mk(id);if(k.s==null)k.s=S.prices[id];/* remember the untouched price before our own selling moves it */
+var p0=S.prices[id],x=Math.max(1,p0*Math.pow(Math.exp(-KS/cap()),m));
+S.cash+=t;yp().i+=t;S.inv[id]-=m;if(!S.inv[id])S.paid[id]=0;
+fatSet(S.loc,id,fatOf(S.loc,id)*x/p0);S.prices[id]=x;
+say('Sold '+m+' '+id+' at '+gbp(u)+' each for '+gbp(t)+(pr>=0?' (+'+gbp(pr)+' profit).':' (a loss of '+gbp(-pr)+').'));stat().sold+=m;render()}
 
 /**
  * Buys medicine: pays and restores health (capped at 100). The button is
@@ -1549,8 +1618,9 @@ ask(title||'You\u2019re under arrest',(desc?desc+' ':'')+(v?'You\u2019re carryin
  *  3. Update lifetime arrest stats; list confiscated stock and its value.
  *  4. Confiscate ALL guns and ALL pocket stock/average prices (the safe is
  *     untouched: that is its purpose).
- *  5. For each year inside: pay property upkeep if affordable, otherwise the
- *     property is evicted (once; afterwards S.prop is null so the loop skips).
+ *  5. For each year inside: pay upkeep on every property via payUp (pocket
+ *     first, then bank), totalling each source for the log; if neither can
+ *     cover it the property is evicted (it leaves S.props, so later years skip it).
  *  6. Fast-forward the calendar: day += d (limited to DAYS+1 = life over),
  *     finish lab batches without moving them to pockets (finishBatches(false)),
  *     restore health to 100 and fed to 70, cool markets d years, new prices.
@@ -1560,9 +1630,9 @@ ask(title||'You\u2019re under arrest',(desc?desc+' ':'')+(v?'You\u2019re carryin
  * @param {number} x - Extra sentence years (can be -1 for "give up").
  * @returns {void}
  */
-function jail(v,x){var gi=gunI(),gy=gunY(),d=clamp(jailDays(v)+x+gy,1,10);yearXp();stat().arr++;stat().jail+=d;var cash0=S.cash,lost=[],lv=0;GOODS.forEach(function(g){var n=S.inv[g.id];if(n){lost.push(n+' '+g.n);lv+=n*S.prices[g.id]}});S.guns=[];GOODS.forEach(function(g){S.inv[g.id]=0;S.paid[g.id]=0});
-var evt='';for(var i=0;i<d;i++){if(S.prop){var pd=PROPS[S.prop.i];if(S.cash>=pd.up)S.cash-=pd.up;else{evt=evict(true)}}}
-S.day=Math.min(S.day+d,DAYS+1);finishBatches(false);S.hp=100;S.food=70;coolMarkets(d);roll();var cl=cash0-S.cash,lt=(lost.length?'Confiscated: '+lost.join(', ')+' (about '+gbp(lv)+')':'You had no stock on you')+(cl>0?'. You also paid '+gbp(cl)+' in property upkeep while inside':'');say('Sentenced to '+d+' year'+(d>1?'s':'')+'. '+lt+'.');note('Sentenced to '+d+' year'+(d>1?'s':''),lt+(gi>=0?' and the '+GUNS[gi].n.toLowerCase()+' found on you added '+gy+' year'+(gy>1?'s':'')+' to the sentence':'')+'. You come out with full health and 70 fed.'+(evt?' '+evt:''));if(S.day>DAYS&&S.hp>0)S.view='over'}
+function jail(v,x){var gi=gunI(),gy=gunY(),d=clamp(jailDays(v)+x+gy,1,10);yearXp();stat().arr++;stat().jail+=d;var up={c:0,b:0},lost=[],lv=0;GOODS.forEach(function(g){var n=S.inv[g.id];if(n){lost.push(n+' '+g.n);lv+=n*S.prices[g.id]}});S.guns=[];GOODS.forEach(function(g){S.inv[g.id]=0;S.paid[g.id]=0});
+var evt='';for(var i=0;i<d;i++){(S.props||[]).slice().forEach(function(p){var r=payUp(PROPS[p.i].up);if(r){up.c+=r.c;up.b+=r.b}else evt+=(evt?' ':'')+evict(p,true)})}
+S.day=Math.min(S.day+d,DAYS+1);finishBatches(false);S.hp=100;S.food=70;coolMarkets(d);roll();var cl=up.c+up.b,lt=(lost.length?'Confiscated: '+lost.join(', ')+' (about '+gbp(lv)+')':'You had no stock on you')+(cl>0?'. You also paid '+gbp(cl)+' in property upkeep while inside ('+upSrc(up)+')':'');say('Sentenced to '+d+' year'+(d>1?'s':'')+'. '+lt+'.');note('Sentenced to '+d+' year'+(d>1?'s':''),lt+(gi>=0?' and the '+GUNS[gi].n.toLowerCase()+' found on you added '+gy+' year'+(gy>1?'s':'')+' to the sentence':'')+'. You come out with full health and 70 fed.'+(evt?' '+evt:''));if(S.day>DAYS&&S.hp>0)S.view='over'}
 
 /**
  * TRAVELS to another district.
@@ -1604,71 +1674,93 @@ render()}
  *    plays, yearly profit tracker, lifetime stats (reset).
  * The heir starts at day 1 with 100 health and 70 fed, a new random name
  * (temporary until confirmHeir) and a face from heirLook(). View becomes
- * 'heirname'.
+ * 'heirname'. The new log starts with ONE inheritance entry (heirLog): it is
+ * written first, so it is both the earliest and the top entry of the new run.
  * @param {string} sx - 'Son' or 'Daughter'.
  * @returns {void}
  */
 function heir(sx){var st={},pd={},left=cap();GOODS.slice().sort(function(a,b){return S.prices[b.id]-S.prices[a.id]}).forEach(function(g){var n=Math.min(Math.ceil(S.inv[g.id]/2),left);st[g.id]=n;pd[g.id]=n?S.paid[g.id]:0;left-=n});
-var c=Math.floor(S.cash/2),bk2=Math.floor(bk()/2);Q=[];S={day:1,gen:S.gen+1,bank:bk2,xp:S.xp||0,guns:[],bag:S.bag,name:pickName(sx==='Son'?'M':'F'),sn:S.sn,fam:nextFam(),line:(S.line||[]).concat([lifeRec()]),st:{sold:0,jail:0,arr:0,rob:0,peak:0},sex:sx,gender:sx==='Son'?'M':'F',look:heirLook(S.look,sx==='Son'?'M':'F'),cash:c,hp:100,food:70,loc:S.loc,inv:st,paid:pd,prop:S.prop,tab:'trade',view:'day',ev:null,log:[],prices:S.prices,flag:S.flag};
-if(S.prop&&S.prop.safe)Object.keys(S.prop.safe).forEach(function(k){S.prop.safe[k]=Math.ceil(S.prop.safe[k]/2)});
-say('They have their parent\u2019s '+KEPT.join(' and ').toLowerCase()+'.');say(S.name+' '+S.sn+', your '+sx.toLowerCase()+', takes over at 18 with '+gbp(c)+' and whatever stock they can carry.');S.view='heirname';S.n0=S.name;S.named=false;roll();render()}
+var c=Math.floor(S.cash/2),bk2=Math.floor(bk()/2);Q=[];S={day:1,gen:S.gen+1,bank:bk2,xp:S.xp||0,guns:[],bag:S.bag,name:pickName(sx==='Son'?'M':'F'),sn:S.sn,fam:nextFam(),line:(S.line||[]).concat([lifeRec()]),st:{sold:0,jail:0,arr:0,rob:0,peak:0},sex:sx,gender:sx==='Son'?'M':'F',look:heirLook(S.look,sx==='Son'?'M':'F'),cash:c,hp:100,food:70,loc:S.loc,inv:st,paid:pd,props:S.props||[],tab:'trade',view:'day',ev:null,log:[],prices:S.prices,flag:S.flag};
+(S.props||[]).forEach(function(p){if(p.safe)Object.keys(p.safe).forEach(function(k){p.safe[k]=Math.ceil(p.safe[k]/2)})});
+say(heirLog(sx,c,bk2));S.view='heirname';S.n0=S.name;S.named=false;roll();render()}
+
+/**
+ * Builds the INHERITANCE log entry for a new heir, read from the NEW state S
+ * (so it must run after heir() has built S and halved the safes). Lists who
+ * takes over and the traits they kept, cash in pocket and in the bank, every
+ * property with its district, each safe's (halved) stock, and the stock the
+ * heir carries. The heir's full name is included so confirmHeir() can swap it
+ * if the player renames them.
+ * @param {string} sx - 'Son' or 'Daughter'.
+ * @param {number} c - Cash inherited into the pocket.
+ * @param {number} b - Money inherited into the bank.
+ * @returns {string} The log text.
+ */
+function heirLog(sx,c,b){
+/* "3 Weed, 2 Cocaine" from any {id:qty} map, skipping empty stacks. */
+var list=function(o){return GOODS.filter(function(g){return (o||{})[g.id]>0}).map(function(g){return o[g.id]+' '+g.n}).join(', ')};
+var ps=(S.props||[]).map(function(p){var sf=list(p.safe);return PROPS[p.i].n+' in '+AREAS[p.loc].n+(sf?' (safe: '+sf+')':' (safe empty)')}),
+    pk=list(S.inv),n=GOODS.reduce(function(t,g){return t+(S.inv[g.id]||0)},0);
+return 'Inheritance: '+S.name+' '+S.sn+', your '+sx.toLowerCase()+', takes over at 18 with their parent\u2019s '+KEPT.join(' and ').toLowerCase()+'. '
+ +'Money: '+gbp(c)+' cash and '+gbp(b)+' in the bank. '
+ +'Properties: '+(ps.length?ps.join('; '):'none')+'. '
+ +'Drugs carried: '+(pk?pk+' ('+n+' units)':'none')+'.'}
 
 /**
  * Where you sleep tonight, and its risks.
  * RULE: only if you own a property IN THE CURRENT DISTRICT do you sleep in it
- * (safe, no cold). Anywhere else you sleep rough (ROUGH).
+ * (safe, no cold). Anywhere else you sleep rough (ROUGH). Each district's
+ * property is its own bed.
  * @returns {{n:string,rob:number,arr:number,cold:number}} Bed description.
  */
-function tonight(){var p=S.prop;if(p&&p.loc===S.loc){var d=PROPS[p.i];return {n:'your '+d.n.toLowerCase(),rob:d.rob,arr:d.arr,cold:0}}return ROUGH}
+function tonight(){var p=P();if(p){var d=PROPS[p.i];return {n:'your '+d.n.toLowerCase(),rob:d.rob,arr:d.arr,cold:0}}return ROUGH}
 
 /**
- * Buys a property here (also used to trade UP from the current one).
- * TRADE-UP MATH: the old property is sold back at 80% FIRST so those funds
- * count toward the purchase; if you still can't afford it, that credit is
- * reversed and nothing changes. The safe (and its cost basis) moves with you;
- * the lab, equipment and batches are LEFT BEHIND (and lost) -- the UI warns
- * about this.
+ * Buys a property in the district you are standing in (also used to trade UP
+ * from the property already here). One property per district: blocked() refuses
+ * the tier you already own, and setP() replaces rather than adds when you trade.
+ * TRADE-UP MATH: the old property here is credited at 80% of its price, so the
+ * purchase needs cash + credit >= price; net cost = price - credit. The safe
+ * (and its cost basis) moves with you; the lab, equipment and batches are LEFT
+ * BEHIND (and lost) -- the UI warns about this. Properties in other districts
+ * are never touched.
  * @param {number} i - PROPS index.
  * @returns {void}
  */
-function buyProp(i){var d=PROPS[i];if(blocked(i))return;var old=S.prop;if(S.prop)S.cash+=Math.round(PROPS[S.prop.i].c*.8);if(S.cash<d.c){if(S.prop)S.cash-=Math.round(PROPS[S.prop.i].c*.8);return}S.cash-=d.c;S.prop={i:i,loc:S.loc};if(old&&old.safe){S.prop.safe=old.safe;S.prop.sp=old.sp}say('You bought a '+d.n.toLowerCase()+' in '+AREAS[S.loc].n+'.');render()}
+function buyProp(i){var d=PROPS[i];if(blocked(i))return;var old=P(),credit=old?Math.round(PROPS[old.i].c*.8):0;if(S.cash+credit<d.c)return;S.cash+=credit-d.c;var np={i:i,loc:S.loc};if(old&&old.safe){np.safe=old.safe;np.sp=old.sp}setP(np);say('You bought a '+d.n.toLowerCase()+' in '+AREAS[S.loc].n+'.');render()}
 
 /**
- * EVICTS the player (unpaid upkeep): everything in the safe, running lab
- * batches, and the lab itself are lost. Builds the message, clears S.prop,
- * logs it and returns the text so callers can also show it in a popup.
+ * EVICTS the player from ONE property (unpaid upkeep): everything in that
+ * property's safe, its running lab batches, and its lab are lost. Builds the
+ * message, removes the property from S.props, stands down any crew assigned
+ * there, logs it and returns the text so callers can also show it in a popup.
+ * Your other properties are unaffected.
+ * @param {Object} p - The property being lost.
  * @param {boolean} [jl] - True if it happened while the player was in jail.
  * @returns {string} The eviction message.
  */
-function evict(jl){var p=S.prop,d=PROPS[p.i],l=[],v=0,sf=p.safe||{},bt=p.batch||{},bl=[];GOODS.forEach(function(g){var n=sf[g.id]||0;if(n){l.push(n+' '+g.n);v+=n*S.prices[g.id]}});Object.keys(bt).forEach(function(k){if(bt[k].n>0)bl.push(bt[k].n+' '+gd(k).n)});
-var t='You were evicted from your '+d.n.toLowerCase()+' in '+AREAS[p.loc].n+' for unpaid upkeep'+(jl?' while you were inside':'')+'. '+(l.length?'You lost everything in the safe: '+l.join(', ')+' (about '+gbp(v)+')':'The safe was empty')+(bl.length?', plus the batches cooking in your lab: '+bl.join(', '):'')+(p.lab?', and your lab and equipment':'')+'.';S.prop=null;say(t);return t}
+function evict(p,jl){var d=PROPS[p.i],l=[],v=0,sf=p.safe||{},bt=p.batch||{},bl=[];GOODS.forEach(function(g){var n=sf[g.id]||0;if(n){l.push(n+' '+g.n);v+=n*S.prices[g.id]}});Object.keys(bt).forEach(function(k){if(bt[k].n>0)bl.push(bt[k].n+' '+gd(k).n)});
+var t='You were evicted from your '+d.n.toLowerCase()+' in '+AREAS[p.loc].n+' for unpaid upkeep'+(jl?' while you were inside':'')+'. '+(l.length?'You lost everything in the safe: '+l.join(', ')+' (about '+gbp(v)+')':'The safe was empty')+(bl.length?', plus the batches cooking in your lab: '+bl.join(', '):'')+(p.lab?', and your lab and equipment':'')+'.';S.props=S.props.filter(function(x){return x!==p});dropCrew(p.loc);say(t);return t}
 
 /**
- * Sells the property for 80% of its price. Refused if it is the Hostel
- * (cannot be sold) or if the safe holds stock / a batch is running.
+ * Sells the property HERE for 80% of its price (properties in other districts
+ * are untouched). Refused if it is the Hostel (cannot be sold) or if its safe
+ * holds stock / a batch is running. Crew assigned to it are stood down.
  * @returns {void}
  */
-function sellProp(){var d=PROPS[S.prop.i];if(locked()||S.prop.i===0)return;S.cash+=Math.round(d.c*.8);S.prop=null;say('You sold the '+d.n.toLowerCase()+'.');render()}
+function sellProp(){var p=P();if(!p)return;var d=PROPS[p.i];if(locked(p)||p.i===0)return;S.cash+=Math.round(d.c*.8);S.props=S.props.filter(function(x){return x!==p});dropCrew(p.loc);say('You sold the '+d.n.toLowerCase()+' in '+AREAS[p.loc].n+'.');render()}
 
 /**
  * Whether the Buy button for property i must be disabled (rules beyond cash).
- * RULES: already owned -> blocked (no duplicate purchases). Level too low -> blocked. If you already own one: upgrading
- * (i higher) is blocked while batches are running (they'd be lost); buying
- * anything else is blocked while the safe or lab is in use (locked()).
+ * RULES (all about the property in THIS district; other districts never matter):
+ * the tier you already own here is blocked ("Already owned"); level too low is
+ * blocked; if you own one here, upgrading (i higher) is blocked while its
+ * batches are running (they'd be lost) and buying anything else is blocked
+ * while its safe or lab is in use (locked()).
  * @param {number} i - PROPS index.
  * @returns {boolean}
  */
-function blocked(i){return owns(i)||lvl()<PROPS[i].u||(!!S.prop&&(i>S.prop.i?pend()>0:locked()))}
-
-/**
- * Do you already own property tier i? Only one property can be held at a time,
- * so re-buying the same tier would just sell it at 80% and buy it back (losing
- * 20% and wiping the lab). This is the "already owned" test used to grey out
- * the Buy button and to reject the purchase inside buyProp() via blocked().
- * @param {number} i - PROPS index.
- * @returns {boolean} True if the player currently owns that property.
- */
-function owns(i){return !!S.prop&&S.prop.i===i}
+function blocked(i){var p=P();return owns(i)||lvl()<PROPS[i].u||(!!p&&(i>p.i?pend(p)>0:locked(p)))}
 
 
 /* ============================================================================
@@ -1678,11 +1770,33 @@ function owns(i){return !!S.prop&&S.prop.i===i}
  * ========================================================================== */
 
 /**
- * "Let the year pass" button. Pays property upkeep (or evicts if you can't),
- * then runs the night via sleep().
+ * PAYS one property's yearly upkeep, choosing the source automatically.
+ * ORDER OF PREFERENCE (keeps pocket cash for food/medicine where possible):
+ *   1. Pocket covers it in full     -> all from pocket.
+ *   2. Otherwise bank covers it     -> all from the bank.
+ *   3. Otherwise pocket + bank do   -> empty the pocket, the bank pays the rest.
+ *   4. Otherwise                    -> nothing is taken; returns null and the
+ *                                      caller evicts.
+ * @param {number} a - Upkeep amount due.
+ * @returns {?{c:number,b:number}} Amount taken from pocket (c) and bank (b), or null if unaffordable.
+ */
+function payUp(a){var c=0,b=0;if(S.cash>=a)c=a;else if(bk()>=a)b=a;else if(S.cash+bk()>=a){c=Math.max(0,S.cash);b=a-c}else return null;S.cash-=c;S.bank=bk()-b;return {c:c,b:b}}
+
+/**
+ * Describes where an upkeep payment came from, for the log.
+ * @param {{c:number,b:number}} r - Result of payUp (or a running total).
+ * @returns {string} e.g. "from your pocket", "from the bank", or "£40 from your pocket and £460 from the bank".
+ */
+function upSrc(r){return r.c&&r.b?gbp(r.c)+' from your pocket and '+gbp(r.b)+' from the bank':r.b?'from the bank':'from your pocket'}
+
+/**
+ * "Let the year pass" button. Pays upkeep for EVERY property you own (each is
+ * charged separately via payUp: pocket first, then the bank; one that pocket
+ * and bank together can't cover is evicted while the others stay). Every
+ * payment is logged with its amount and source. Then runs the night via sleep().
  * @returns {void}
  */
-function endDay(){var p=S.prop;if(p){var d=PROPS[p.i];if(S.cash>=d.up){S.cash-=d.up;say('You paid '+gbp(d.up)+' in upkeep for your '+d.n.toLowerCase()+'.')}else{note('Evicted',evict())}}sleep(tonight())}
+function endDay(){var ev=[];(S.props||[]).slice().forEach(function(p){var d=PROPS[p.i],r=payUp(d.up);if(r)say('You paid '+gbp(d.up)+' in upkeep for your '+d.n.toLowerCase()+' in '+AREAS[p.loc].n+' ('+upSrc(r)+').');else ev.push(evict(p))});if(ev.length)note('Evicted',ev.join('<br>'));sleep(tonight())}
 
 /**
  * RUNS ONE YEAR'S END. This is the main simulation step.
@@ -1737,18 +1851,19 @@ function heatBand(h){return h<5?0:h<16?1:h<31?2:h<56?3:h<90?4:5}
  *   bed   : (only when `full`) tonight's arrest chance as a percent
  *           (arr*100), x1.6 if carrying stock, x0.3 if clean. Sleeping rough
  *           (arr=0.16) is therefore far worse than a Safehouse.
- *   cook  : (only when `full`, with a lab) k = number of drugs cooking.
- *           Heat term = (2k + k*(k-1)) * 1.5 = k*(k+1)*1.5, which grows
- *           faster than linearly (1 drug = 3, 2 = 9, 3 = 18, 5 = 45), scaled
- *           by the LAB's district heat (not where you're standing).
+ *   cook  : (only when `full`) EVERY property with a lab adds its own term.
+ *           With n drugs cooking at one property the term is
+ *           (2n + n*(n-1)) * 1.5 = n*(n+1)*1.5, which grows faster than
+ *           linearly (1 drug = 3, 2 = 9, 3 = 18, 5 = 45), scaled by THAT
+ *           property's district heat. Terms from different labs simply add up.
  *   Combine: ((stock + bed) * districtHeat + cook) * (1 - bribeCut).
  *   Then clamp to 1..100 and round to one decimal (x10, round, /10).
- * @param {number} [k] - Hypothetical number of drugs cooking (default: actual).
+ * @param {number} [k] - Hypothetical number of drugs cooking at the property HERE (default: actual).
  * @param {boolean} [full] - Include the sleeping and lab terms.
  * @returns {number} Heat percent 1..100.
  */
 function heat(k,full){var cut=S.bribe?PROT[S.bribe.l].cut:0,hl=AREAS[S.loc].heat,c=carried(),stock=c>0?4+10*c/cap()+Math.min(20,worth()/2000):0,bed=0,cook=0;
-if(full){bed=tonight().arr*100*(c>0?1.6:.3);if(S.prop&&S.prop.lab){if(k===undefined)k=cooks();cook=(2*k+k*(k-1))*1.5*AREAS[S.prop.loc].heat}}
+if(full){bed=tonight().arr*100*(c>0?1.6:.3);var here=P();(S.props||[]).forEach(function(p){if(!p.lab)return;var n=(p===here&&k!==undefined)?k:cooks(p);cook+=(2*n+n*(n-1))*1.5*AREAS[p.loc].heat})}
 return Math.round(Math.max(1,Math.min(100,((stock+bed)*hl+cook)*(1-cut)))*10)/10}
 
 /**
@@ -1775,11 +1890,20 @@ var fine=Math.round(S.cash*.03),tk=[];GOODS.forEach(function(g){var t=Math.ceil(
 function stopped(){if(carried()<1){say('Pulled over and searched. They found nothing and moved you on.');return}arrest(false,0,'Pulled over','Officers stop you and want to search your things.')}
 
 /**
- * Seizes every RUNNING lab batch (batches already finished and "waiting"
- * for room are not touched).
+ * Seizes every RUNNING lab batch at one property (batches already finished and
+ * "waiting" for room are not touched).
+ * @param {Object|null} p - The property being raided.
  * @returns {number} How many batches were seized.
  */
-function seize(){var p=S.prop,n=0;if(p&&p.batch)Object.keys(p.batch).forEach(function(id){if(!p.batch[id].w){delete p.batch[id];n++}});return n}
+function seize(p){var n=0;if(p&&p.batch)Object.keys(p.batch).forEach(function(id){if(!p.batch[id].w){delete p.batch[id];n++}});return n}
+
+/**
+ * Chooses which property a raid hits: the one with the MOST batches cooking
+ * (the biggest heat source; the first one wins a tie). With nothing cooking
+ * anywhere it falls back to the property you are standing at, if any.
+ * @returns {Object|null} A property, or null if you own none.
+ */
+function raidTarget(){var best=null,bn=0;(S.props||[]).forEach(function(p){var n=cooks(p);if(n>bn){best=p;bn=n}});return best||P()}
 
 /**
  * Dispatches a heat tier to its police action.
@@ -1795,19 +1919,21 @@ function runTier(t){if(t===1)searched();else if(t===2)stopped();else if(t===3)st
 function sting(){if(carried()<1){say('A buyer turned out to be an undercover officer, but you had nothing on you.');return}say('Undercover sting! The “buyer” was a police officer.');arrest()}
 
 /**
- * TIER 4: police raid. Seizes running batches. You are arrested (NO running)
- * if you carry stock OR you are standing at your lab's property.
+ * TIER 4: police raid on the raid target property (see raidTarget). Seizes its
+ * running batches. You are arrested (NO running) if you carry stock OR you are
+ * standing at the raided property after losing batches.
  * @returns {void}
  */
-function policeRaid(){var n=seize(),p=S.prop;note('Police raid!',(n?'They seized '+n+' running batch'+(n>1?'es':'')+'.':'They searched the place and found nothing running.'));if(carried()>0||(n&&p&&S.loc===p.loc))arrest(true)}
+function policeRaid(){var p=raidTarget(),n=seize(p),w=p?' at your '+PROPS[p.i].n.toLowerCase()+' in '+AREAS[p.loc].n:'';note('Police raid!',(n?'They seized '+n+' running batch'+(n>1?'es':'')+w+'.':'They searched the place'+w+' and found nothing running.'));if(carried()>0||(n&&p&&S.loc===p.loc))arrest(true)}
 
 /**
- * TIER 5: FBI raid. Seizes batches, DESTROYS the lab and equipment, fines
- * 25% of cash, and arrests you with +3 extra years and no escape.
+ * TIER 5: FBI raid on the raid target property. Seizes its batches, DESTROYS
+ * its lab and equipment, fines 25% of cash, and arrests you with +3 extra
+ * years and no escape. Your other properties keep their labs.
  * @returns {void}
  */
-function fbi(){var n=seize(),p=S.prop,fine=Math.round(S.cash*.25),lab=p&&p.lab;S.cash-=fine;if(p){p.lab=false;p.eq={}}
-note('FBI raid!',(n?'They seized '+n+' batch'+(n>1?'es':'')+', ':'')+(lab?'wrecked your lab and equipment, ':'')+'and fined you '+gbp(fine)+'.');arrest(true,3)}
+function fbi(){var p=raidTarget(),n=seize(p),fine=Math.round(S.cash*.25),lab=p&&p.lab;S.cash-=fine;if(p){p.lab=false;p.eq={}}
+note('FBI raid!',(p?'They hit your '+PROPS[p.i].n.toLowerCase()+' in '+AREAS[p.loc].n+'. ':'')+(n?'They seized '+n+' batch'+(n>1?'es':'')+', ':'')+(lab?'wrecked your lab and equipment, ':'')+'and fined you '+gbp(fine)+'.');arrest(true,3)}
 
 /**
  * Yearly police check (run in sleep()). Rolls once against the full heat
@@ -1847,61 +1973,157 @@ function bribe(i){var x=PROT[i];if(S.cash<x.c||lvl()<x.u||(S.bribe&&S.bribe.l>i)
  * ======  SECTION 29: SAFE STORAGE & SPACE ACCOUNTING  =======================
  * ============================================================================
  * ========================================================================== */
-/* The property's safe is S.prop.safe = {drugId: units}; S.prop.sp holds the
+/* Each property's safe is p.safe = {drugId: units}; p.sp holds the
  * AVERAGE COST per unit of the safe stock (for profit tracking). Stock in the
  * safe cannot be mugged, seized, fined or confiscated. */
 
-/** Safe capacity of the owned property (SLOTS table). @returns {number} */
-function safeCap(){return SLOTS[S.prop.i]}
-
-/** Units currently in the safe. @returns {number} */
-function safeCount(){var s=S.prop.safe||{};return GOODS.reduce(function(t,g){return t+(s[g.id]||0)},0)}
-
-/** Street value of the safe stock at local prices (counts toward net worth). @returns {number} */
-function safeWorth(){var s=(S.prop&&S.prop.safe)||{};return GOODS.reduce(function(t,g){return t+(s[g.id]||0)*S.prices[g.id]},0)}
-
-/** Units in lab batches still running or waiting. @returns {number} */
-function pend(){var b=S.prop.batch||{};return Object.keys(b).reduce(function(t,k){return t+b[k].n},0)}
+/* ============================================================================
+ * ============================================================================
+ * ======  SECTION 28B: PROPERTIES (ONE PER DISTRICT)  ========================
+ * ============================================================================
+ * ========================================================================== */
+/* You may own ONE property in EACH district. S.props is an array of property
+ * objects {i, loc, safe, sp, lab, eq, batch}: `i` is the PROPS tier, `loc` the
+ * district index (unique across the array, which is what enforces the
+ * one-per-district rule) and the rest is that property's OWN safe, lab,
+ * equipment and cooking batches. Crew tasks carry a district index (task.p)
+ * so each relative works at one specific property. The property in the district
+ * you are standing in is "here" (P()); it is the only one whose safe, lab,
+ * crew assignment and bed you can use right now. */
 
 /**
- * FREE SPACE for new production: pocket space + safe space, minus what
- * running batches will need when they finish.
+ * Finds the property owned in a given district.
+ * @param {number} l - District index (AREAS).
+ * @returns {Object|null} The property object, or null if you own none there.
+ */
+function PA(l){var a=S.props||[],i;for(i=0;i<a.length;i++)if(a[i].loc===l)return a[i];return null}
+
+/**
+ * The property in the district you are standing in ("here").
+ * @returns {Object|null} Property object or null.
+ */
+function P(){return PA(S.loc)}
+
+/**
+ * Adds a property, replacing any existing one in the SAME district. Filtering
+ * on `loc` before adding is what guarantees at most one property per district.
+ * @param {Object} np - New property object (must carry .loc).
+ * @returns {void}
+ */
+function setP(np){S.props=(S.props||[]).filter(function(x){return x.loc!==np.loc}).concat([np])}
+
+/**
+ * Do you already own property tier i in THIS district? Used to grey out the
+ * Buy button ("Already owned") and, through blocked(), to reject a repeat
+ * purchase. Owning the same tier in another district does not count, because
+ * each district gets its own property.
+ * @param {number} i - PROPS index.
+ * @returns {boolean} True if the property here is exactly this tier.
+ */
+function owns(i){var p=P();return !!p&&p.i===i}
+
+/**
+ * Stands down every relative assigned to a district (used when its property
+ * is sold or evicted, since they would have nowhere to work).
+ * @param {number} loc - District index.
+ * @returns {void}
+ */
+function dropCrew(loc){(S.fam||[]).forEach(function(r){if(r.task&&r.task.p===loc)r.task=null})}
+
+/**
+ * Readable list of every property owned, e.g. "Flat (Docklands), Hostel (Uptown)".
+ * @returns {string} The list, or "None".
+ */
+function propNames(){var a=S.props||[];return a.length?a.map(function(p){return PROPS[p.i].n+' ('+AREAS[p.loc].n+')'}).join(', '):'None'}
+
+/**
+ * Builds the Property card for the Home tab: the property in THIS district
+ * (with a sell button), a note on any others you own, then the buy list.
+ * The buy list is for the district you are standing in. A tier you already own
+ * here shows a greyed-out "Already owned" button; other tiers are trade-ups.
+ * @returns {string} HTML.
+ */
+function propView(){var p=P(),all=S.props||[],here=AREAS[S.loc].n,h='<div class="card"><h2>Property in '+here+'</h2><p class="log">You can own one property in each district, each with its own safe, lab, bed and crew.</p>';
+if(p){var d=PROPS[p.i];h+='<p class="lead">You own a '+d.n.toLowerCase()+' here. Upkeep '+gbp(d.up)+' a year. '+(p.i===0?'It can\u2019t be sold, but trading up still gives you '+gbp(PROPS[0].c*.8)+' back.':'It sells for '+gbp(d.c*.8)+'.')+' Safe holds '+SLOTS[p.i]+'.</p>'+(p.lab?'<p class="log">Your lab and equipment go with the property if you sell or trade up.</p>':'')+(locked(p)?'<p class="log">You can\u2019t sell while the safe has stock or a batch is running. Upgrading moves your stock to the new safe, but the lab and equipment stay behind, so let batches finish first.</p>':'')+(p.i===0?'':'<button class="danger full" onclick="sellProp()"'+(locked(p)?' disabled':'')+'>Sell property</button>')}
+else h+='<p class="lead">No place of your own in '+here+', so you sleep rough here: cold, and easy prey. Buy a place in '+here+' to sleep safely whenever you end the year in this district.</p>';
+/* Other districts: list them and show the combined yearly upkeep (money out every year-end). */
+var el=all.filter(function(x){return x!==p});if(el.length)h+='<p class="log">Also owned: '+el.map(function(x){return PROPS[x.i].n+' in '+AREAS[x.loc].n}).join(', ')+'. Total upkeep for all properties: '+gbp(all.reduce(function(t,x){return t+PROPS[x.i].up},0))+' a year.</p>';
+return h+PROPS.map(function(x,i){var own=owns(i);return '<div class="row"><div class="nm"><b>'+x.n+'</b> '+gbp(x.c)+'<small>Upkeep '+gbp(x.up)+' a year. Safe slots: '+SLOTS[i]+'. '+(lvl()<x.u?'Unlocks at level '+x.u:x.info)+'</small></div><button onclick="buyProp('+i+')" '+(own||S.cash+(p?PROPS[p.i].c*.8:0)<x.c||blocked(i)?'disabled':'')+'>'+(own?'Already owned':'Buy')+'</button></div>'}).join('')+'</div>'}
+
+
+/** Safe capacity of a property (SLOTS table). @param {Object} [p] - Property (default: the one here). @returns {number} */
+function safeCap(p){p=p||P();return SLOTS[p.i]}
+
+/** Units currently in a property's safe. @param {Object} [p] - Property (default: here). @returns {number} */
+function safeCount(p){p=p||P();var s=p.safe||{};return GOODS.reduce(function(t,g){return t+(s[g.id]||0)},0)}
+
+/**
+ * Street value of the stock in EVERY property's safe at local prices (counts
+ * toward net worth). Summing over S.props means safes in other districts are
+ * valued too.
+ * @returns {number} Pounds.
+ */
+function safeWorth(){return (S.props||[]).reduce(function(t,p){var s=p.safe||{};return t+GOODS.reduce(function(u,g){return u+(s[g.id]||0)*S.prices[g.id]},0)},0)}
+
+/** Units in a property's lab batches still running or waiting. @param {Object} [p] - Property (default: here). @returns {number} */
+function pend(p){p=p||P();var b=p.batch||{};return Object.keys(b).reduce(function(t,k){return t+b[k].n},0)}
+
+/**
+ * FREE SPACE for new production at a property: its safe space minus what its
+ * running batches will need, PLUS pocket space only when you are standing in
+ * that property's district (finished batches only reach your pockets when you
+ * are there; a remote property's output can only go into its own safe).
+ * @param {Object} [p] - Property (default: here).
  * @returns {number} Units (never below 0).
  */
-function room(){return Math.max(0,cap()-carried()+safeCap()-safeCount()-pend())}
+function room(p){p=p||P();return Math.max(0,(p.loc===S.loc?cap()-carried():0)+safeCap(p)-safeCount(p)-pend(p))}
 
 /**
- * True if the property holds stock or running batches (so it cannot be
+ * True if a property holds stock or running batches (so it cannot be
  * sold/downgraded without losing them).
+ * @param {Object} [p] - Property (default: here).
  * @returns {boolean}
  */
-function locked(){return !!S.prop&&(safeCount()>0||pend()>0)}
+function locked(p){p=p||P();return !!p&&(safeCount(p)>0||pend(p)>0)}
 
 /**
- * Number of drugs currently being cooked (not waiting for space).
+ * Number of drugs a property is currently cooking (not waiting for space).
  * Feeds the cook term of the heat formula.
+ * @param {Object} [p] - Property (default: here).
  * @returns {number}
  */
-function cooks(){var b=(S.prop&&S.prop.batch)||{};return Object.keys(b).filter(function(k){return !b[k].w}).length}
+function cooks(p){p=p||P();var b=(p&&p.batch)||{};return Object.keys(b).filter(function(k){return !b[k].w}).length}
 
 /**
- * COMPLETES lab batches at the year turn.
+ * COMPLETES lab batches at the year turn, for EVERY property.
+ * Each property finishes its own batches (finishAt). Stock only reaches your
+ * POCKETS at the property in the district you are standing in; everywhere else
+ * it goes into that property's safe or waits at the lab.
+ * @param {boolean} home - True if finished stock may be placed in pockets.
+ * @returns {void}
+ */
+function finishBatches(home){(S.props||[]).forEach(function(p){finishAt(p,home&&p.loc===S.loc)})}
+
+/**
+ * Finishes the batches of ONE property.
  * ORDER: crew batches (flag c) first, then the player's, by sorting on the
  * flag (c?1:0 descending). Each batch's output goes to:
- *   1. the SAFE first (up to free safe space),
- *   2. then POCKETS (only if `home` is true),
+ *   1. the property's SAFE first (up to its free safe space),
+ *   2. then POCKETS (only if `home` is true, i.e. you are there),
  *   3. anything left stays at the lab flagged `w` (waiting for room) and a
  *      popup tells the player once; it can be collected later.
  * COST BASIS: each addition updates the stock's average unit cost with a
  * weighted average: newAvg = (oldAvg*oldQty + batchUnitCost*addedQty) / (oldQty+addedQty).
+ * @param {Object} p - The property.
  * @param {boolean} home - True if finished stock may be placed in pockets.
  * @returns {void}
  */
-function finishBatches(home){var p=S.prop;if(!p||!p.batch)return;var sf=p.safe=p.safe||{},sp=p.sp=p.sp||{};
-Object.keys(p.batch).sort(function(a,c){return (p.batch[c].c?1:0)-(p.batch[a].c?1:0)}).forEach(function(id){var b=p.batch[id],g=gd(id),m=Math.min(b.n,safeCap()-safeCount());
-if(m>0){var q=sf[id]||0;sp[id]=((sp[id]||0)*q+b.u*m)/(q+m);sf[id]=q+m;b.n-=m;say(m+' '+g.n+' finished cooking and went into the safe.')}
+function finishAt(p,home){if(!p.batch)return;var wh=' in '+AREAS[p.loc].n;
+var sf=p.safe=p.safe||{},sp=p.sp=p.sp||{};
+Object.keys(p.batch).sort(function(a,c){return (p.batch[c].c?1:0)-(p.batch[a].c?1:0)}).forEach(function(id){var b=p.batch[id],g=gd(id),m=Math.min(b.n,safeCap(p)-safeCount(p));
+if(m>0){var q=sf[id]||0;sp[id]=((sp[id]||0)*q+b.u*m)/(q+m);sf[id]=q+m;b.n-=m;say(m+' '+g.n+' finished cooking and went into the safe'+wh+'.')}
 if(b.n>0&&home){var k=Math.min(b.n,cap()-carried());if(k>0){var pq=S.inv[id];S.paid[id]=(S.paid[id]*pq+b.u*k)/(pq+k);S.inv[id]+=k;b.n-=k;say(k+' '+g.n+' finished cooking and went into your pockets.')}}
-if(b.n>0){if(!b.w)note('Batch waiting for room',b.n+' '+g.n+' are waiting at the lab because there\u2019s no room for them.');b.w=1}else delete p.batch[id]})}
+if(b.n>0){if(!b.w)note('Batch waiting for room',b.n+' '+g.n+' are waiting at the lab'+wh+' because there\u2019s no room for them.');b.w=1}else delete p.batch[id]})}
 
 /**
  * DEPOSITS stock from pockets into the safe (weighted-average cost basis).
@@ -1910,7 +2132,7 @@ if(b.n>0){if(!b.w)note('Batch waiting for room',b.n+' '+g.n+' are waiting at the
  * @param {number} n - Units (99999 = "max").
  * @returns {void}
  */
-function dep(id,n){var p=S.prop,sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},m=Math.min(n,S.inv[id],safeCap()-safeCount());if(m<1)return;var q=sf[id]||0;sp[id]=((sp[id]||0)*q+S.paid[id]*m)/(q+m);sf[id]=q+m;S.inv[id]-=m;if(!S.inv[id])S.paid[id]=0;say('Put '+m+' '+gd(id).n+' in the safe.');render()}
+function dep(id,n){var p=P(),sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},m=Math.min(n,S.inv[id],safeCap()-safeCount());if(m<1)return;var q=sf[id]||0;sp[id]=((sp[id]||0)*q+S.paid[id]*m)/(q+m);sf[id]=q+m;S.inv[id]-=m;if(!S.inv[id])S.paid[id]=0;say('Put '+m+' '+gd(id).n+' in the safe.');render()}
 
 /**
  * WITHDRAWS stock from the safe into pockets (weighted-average cost basis).
@@ -1919,7 +2141,7 @@ function dep(id,n){var p=S.prop,sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},m=Math.min
  * @param {number} n - Units (99999 = "max").
  * @returns {void}
  */
-function wd(id,n){var p=S.prop,sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},m=Math.min(n,sf[id]||0,cap()-carried());if(m<1)return;var q=S.inv[id];S.paid[id]=(S.paid[id]*q+(sp[id]||0)*m)/(q+m);S.inv[id]+=m;sf[id]-=m;if(!sf[id])sp[id]=0;say('Took '+m+' '+gd(id).n+' out of the safe.');render()}
+function wd(id,n){var p=P(),sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},m=Math.min(n,sf[id]||0,cap()-carried());if(m<1)return;var q=S.inv[id];S.paid[id]=(S.paid[id]*q+(sp[id]||0)*m)/(q+m);S.inv[id]+=m;sf[id]-=m;if(!sf[id])sp[id]=0;say('Took '+m+' '+gd(id).n+' out of the safe.');render()}
 
 /**
  * COLLECTS a finished batch that was "waiting for room": fills the safe
@@ -1928,7 +2150,7 @@ function wd(id,n){var p=S.prop,sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},m=Math.min(
  * @param {string} id - Drug id.
  * @returns {void}
  */
-function collect(id){var p=S.prop,b=p&&p.batch&&p.batch[id];if(!b||!b.w)return;var g=gd(id),sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},t=0,m=Math.min(b.n,Math.max(0,safeCap()-safeCount()));
+function collect(id){var p=P(),b=p&&p.batch&&p.batch[id];if(!b||!b.w)return;var g=gd(id),sf=p.safe=p.safe||{},sp=p.sp=p.sp||{},t=0,m=Math.min(b.n,Math.max(0,safeCap()-safeCount()));
 if(m>0){var q=sf[id]||0;sp[id]=((sp[id]||0)*q+b.u*m)/(q+m);sf[id]=q+m;b.n-=m;t+=m}
 var k=Math.min(b.n,Math.max(0,cap()-carried()));if(k>0){var pq=S.inv[id];S.paid[id]=(S.paid[id]*pq+b.u*k)/(pq+k);S.inv[id]+=k;b.n-=k;t+=k}
 if(t<1)return;say('Collected '+t+' '+g.n+' from the lab.');if(b.n<=0)delete p.batch[id];render()}
@@ -1939,7 +2161,7 @@ if(t<1)return;say('Collected '+t+' '+g.n+' from the lab.');if(b.n<=0)delete p.ba
  * each disabled when it couldn't move anything.
  * @returns {string} HTML ('' if no property here).
  */
-function safeView(){var p=S.prop;if(!p||p.loc!==S.loc)return '';var sf=p.safe||{},sc=safeCap(),n=safeCount();
+function safeView(){var p=P();if(!p)return '';var sf=p.safe||{},sc=safeCap(),n=safeCount();
 return '<div class="card"><h2>Safe</h2><p class="log">Safe from muggings, raids and jail. Holds '+n+' of '+sc+'.</p>'+ug().map(function(g){var q=sf[g.id]||0,pk=S.inv[g.id],bi=pk&&n<sc?'':' disabled',bo=q&&carried()<cap()?'':' disabled',a='<button style="flex:1" onclick="';return '<div class="row" style="flex-wrap:wrap"><div class="nm" style="flex:1 1 100%"><b>'+g.n+'</b><small>In safe '+q+' · in pockets '+pk+'</small></div><div class="btns" style="flex:1 1 100%">'+a+'dep(\''+g.id+'\',1)"'+bi+'>In 1</button>'+a+'dep(\''+g.id+'\',99999)"'+bi+'>In max</button>'+a+'wd(\''+g.id+'\',1)"'+bo+'>Out 1</button>'+a+'wd(\''+g.id+'\',99999)"'+bo+'>Out max</button></div></div>'}).join('')+'</div>'}
 
 
@@ -1970,14 +2192,14 @@ function ing(g){return Math.max(1,Math.round(g.lo*(1-LABDISC)))}
 function gd(id){return GOODS.filter(function(x){return x.id===id})[0]}
 
 /** Builds a lab in the current property (costs LAB). @returns {void} */
-function buildLab(){S.cash-=LAB;S.prop.lab=true;S.prop.eq=S.prop.eq||{};say('You built a lab in your '+PROPS[S.prop.i].n.toLowerCase()+'.');render()}
+function buildLab(){var p=P();S.cash-=LAB;p.lab=true;p.eq=p.eq||{};say('You built a lab in your '+PROPS[p.i].n.toLowerCase()+' in '+AREAS[p.loc].n+'.');render()}
 
 /**
  * Buys the equipment for one drug (price g.eq). Permanent until the lab is lost.
  * @param {string} id - Drug id.
  * @returns {void}
  */
-function buyEq(id){var g=gd(id);S.cash-=g.eq;(S.prop.eq=S.prop.eq||{})[id]=1;say('You bought the '+g.n+' equipment.');render()}
+function buyEq(id){var g=gd(id);S.cash-=g.eq;(P().eq=P().eq||{})[id]=1;say('You bought the '+g.n+' equipment.');render()}
 
 /**
  * Starts a cooking batch (ready next year). One batch per drug at a time.
@@ -1989,23 +2211,22 @@ function buyEq(id){var g=gd(id);S.cash-=g.eq;(S.prop.eq=S.prop.eq||{})[id]=1;say
  * @param {number} n - Units requested (9999 = Max).
  * @returns {void}
  */
-function cook(id,n){var g=gd(id),u=ing(g),p=S.prop,b=p.batch=p.batch||{};if(b[id])return;var r=room(),af=Math.floor(S.cash/u),m=Math.min(n,r,af);
+function cook(id,n){var g=gd(id),u=ing(g),p=P(),b=p.batch=p.batch||{};if(b[id])return;var r=room(),af=Math.floor(S.cash/u),m=Math.min(n,r,af);
 if(m<1){note('Can\u2019t cook '+g.n,r<1?'There\u2019s no space left in your safe or pockets.':'You can\u2019t afford the ingredients ('+gbp(u)+' each).');return}
 if(m<n&&n<9999)note('Smaller batch than asked','You asked for '+n+' '+g.n+' but only '+m+' were started: '+(r<af?'there\u2019s only room for '+r+' (safe and pockets, minus running batches).':'you can only afford ingredients for '+af+'.'));
 S.cash-=u*m;yp().o+=u*m;b[id]={n:m,u:u};say('Started cooking '+m+' '+g.n+' for '+gbp(u*m)+'. It will be ready next year.');render()}
 
 /**
- * Builds the Lab tab. STATES: no property -> hint; property elsewhere ->
- * travel hint; no lab -> Build button; lab present -> per-drug rows that are
+ * Builds the Lab tab. STATES: no property in this district ->
+ * hint; no lab -> Build button; lab present -> per-drug rows that are
  * either "buy equipment", "cook 1/10/max", or the status of a running /
  * waiting batch (with a Collect button sized to the free space `cf`).
  * The header previews heat now and (if under 5 drugs cooking) what ONE MORE
  * cooking drug would raise it to, via raidPct(cooks()+1).
  * @returns {string} HTML.
  */
-function labView(){var p=S.prop,c='<div class="card"><h2>Lab</h2>';
-if(!p)return c+'<p class="lead">You need a property first. Buy one in the Home tab, then build a lab there.</p></div>';
-if(p.loc!==S.loc)return c+'<p class="lead">Your lab is at your '+PROPS[p.i].n.toLowerCase()+' in '+AREAS[p.loc].n+'. Travel there to cook.</p></div>';
+function labView(){var p=P(),c='<div class="card"><h2>Lab in '+AREAS[S.loc].n+'</h2>';
+if(!p)return c+'<p class="lead">You have no property in '+AREAS[S.loc].n+'. Buy one in the Home tab, then build a lab there. Every property has its own lab.</p></div>';
 if(!p.lab)return c+'<p class="lead">Your '+PROPS[p.i].n.toLowerCase()+' has no lab yet. Selling or trading up the property loses the lab and its equipment.</p><button class="main full" onclick="buildLab()" '+(S.cash<LAB?'disabled':'')+'>Build lab · '+gbp(LAB)+'</button></div>';
 var eq=p.eq||{},free=room(),bt=p.batch||{},cf=Math.max(0,safeCap()-safeCount())+Math.max(0,cap()-carried());
 return c+'<p class="log">One batch of each drug at a time, ready next year. Ingredients always cost the same: 10% below the lowest normal price of that drug, whatever the market is doing. Space for '+free+' more. Heat is '+raidPct()+'%'+(cooks()<5?'; one more drug cooking would make it '+raidPct(cooks()+1)+'%':'')+'.</p>'+ug().map(function(g){var u=ing(g),has=eq[g.id],m=Math.min(free,Math.floor(S.cash/u)),off=m<1?'disabled':'',b=bt[g.id];return '<div class="row"><div class="nm"><b>'+g.n+'</b><small>'+(has?'Ingredients '+gbp(u)+' each · market '+gbp(S.prices[g.id]):'Equipment '+gbp(g.eq))+'</small></div>'+(has&&b?'<div style="text-align:right"><small>'+(b.w?b.n+' waiting for room':'Cooking '+b.n+', ready next year')+'</small>'+(b.w?'<button class="mini" style="display:block;margin:4px 0 0 auto" onclick="collect(\''+g.id+'\')"'+(cf<1?' disabled':'')+'>Collect '+Math.min(b.n,cf)+'</button>':'')+'</div>':has?'<div class="btns"><button onclick="cook(\''+g.id+'\',1)" '+off+'>Cook 1</button><button onclick="cook(\''+g.id+'\',10)" '+off+'>Cook 10</button><button onclick="cook(\''+g.id+'\',9999)" '+off+'>Max '+m+'</button></div>':'<button onclick="buyEq(\''+g.id+'\')" '+(S.cash<g.eq?'disabled':'')+'>Buy</button>')+'</div>'}).join('')+'</div>'}
@@ -2436,10 +2657,10 @@ var HELP='<p class="lead">Build a fortune across generations. Each turn is one y
 +'<p class="lead"><b>Trade.</b> Buy stock where it’s cheap and sell where it’s dear. Prices change by district and every year. You can carry 15 items, more with a bag.</p>'
 +'<p class="lead"><b>Survive.</b> You lose 30 fed each year. Eat, or your health drops. Well fed and indoors, you heal.</p>'
 +'<p class="lead"><b>Odd jobs.</b> Broke? The Trade tab has cash-in-hand jobs: wash dishes, deliver a package or collect a debt. You can work one job a year. Some carry a risk of police or a beating.</p>'
-+'<p class="lead"><b>Shelter.</b> With no property you sleep rough: it’s cold, and you’re far more likely to be robbed or arrested. Buy a property in the Home tab and you sleep there whenever you end the year in that district. It has yearly upkeep and sells back for 80%.</p>'
++'<p class="lead"><b>Shelter.</b> With no property you sleep rough: it’s cold, and you’re far more likely to be robbed or arrested. Buy a property in the Home tab and you sleep there whenever you end the year in that district. You can own one property in each district, and each has its own safe, lab, bed and crew. Every property has yearly upkeep and sells back for 80%.</p>'
 +'<p class="lead"><b>Bloodline.</b> Every character has a name and a life record. When they die your son or daughter takes over, and the Family tree in the menu shows everyone who came before.</p>'
 +'<p class="lead"><b>Looks.</b> Choose male or female, then shape the face: hair, hair colour, facial hair colour, eyebrows, eyes, nose, mouth, head shape, accessories and facial hair (or marks for women), with 10 options each. Skin tone, hair colour, facial hair colour and eye colour pass down every generation. Each heir keeps two random features from their parent, and the rest change.</p>'
-+'<p class="lead"><b>Crew.</b> Relatives can work for you once you have a property. Cooks start a batch every year for a 15% fee on ingredients. Sellers sell up to 10 units a year from your safe for a 15% cut. They can be arrested, which takes them out for a few years.</p>'
++'<p class="lead"><b>Crew.</b> Relatives can work for you once you have a property. Each relative works at one property, which you choose by assigning them while you are in that district. Cooks start a batch every year for a 15% fee on ingredients. Sellers sell up to 10 units a year from your safe for a 15% cut. They can be arrested, which takes them out for a few years.</p>'
 +'<p class="lead"><b>Bags.</b> Buy a bag in the Gear tab for more pocket slots. Better bags unlock as you level, and they pass on to your heirs.</p>'
 +'<p class="lead"><b>Market.</b> Your trades move prices in that district. Buying pushes the price up and selling pushes it down, so buying and selling back and forth just loses you money. Buy cheap, travel and sell dear. Prices settle back toward normal as years pass.</p>'
 +'<p class="lead"><b>Levels.</b> You earn XP once a year, when you let the year pass. The game takes the money your trading brought in that year (sales and crew sales) and subtracts what you spent on stock and lab ingredients. Your XP is the square root of that profit divided by 1.2649, then divided again by your level raised to the power 1.965, so the higher your level, the more profit each XP costs. At level 1, £1,000 profit earns 25 XP. At level 20 you need about £130 million for the same 25 XP. A loss earns nothing. Each level unlocks something new: a drug, a property, someone higher up to bribe, a bigger bag or a better weapon. There are 20 levels, from Street Kid to Kingpin. You start with Weed, Shrooms and Hash, a hostel, the beat cops and a knife. Levels carry on to your heirs.</p>'
@@ -2447,7 +2668,7 @@ var HELP='<p class="lead">Build a fortune across generations. Each turn is one y
 +'<p class="lead"><b>Guns.</b> Buy them in the Guns tab. Your best one boosts your odds in fights but adds years to your sentence if police find it.</p>'
 +'<p class="lead"><b>Bank.</b> Open the Home tab to deposit or withdraw cash. Money in the bank can’t be robbed, seized in a raid or taken by a fine, and it counts toward your net worth. Your heir inherits half.</p>'
 +'<p class="lead"><b>Safe.</b> Every property has a safe. Stock inside is safe from muggings, raids and jail, but you can only reach it when you’re at the property. Better properties hold more. You can’t sell the property while the safe has stock in it, but you can upgrade and the stock moves with you.</p>'
-+'<p class="lead"><b>Lab.</b> At a property you can build a lab, buy equipment for each drug, then cook one batch of each drug at once. A batch finishes when the year passes and goes into your safe first. Ingredients always cost the same: 10% below the lowest normal price of each drug, whatever the market is doing. The lab and equipment go with the property. If a finished batch is waiting for room, free some space and press Collect to take what fits straight away. Crew batches are collected first at the turn of the year.</p>'
++'<p class="lead"><b>Lab.</b> At a property you can build a lab, buy equipment for each drug, then cook one batch of each drug at once. A batch finishes when the year passes and goes into your safe first. Ingredients always cost the same: 10% below the lowest normal price of each drug, whatever the market is doing. The lab and equipment go with the property. If a finished batch is waiting for room, free some space and press Collect to take what fits straight away. Crew batches are collected first at the turn of the year. Every property can have its own lab, heat from all your labs adds up, and a raid hits the property with the most batches cooking.</p>'
 +'<p class="lead"><b>Heat.</b> The heat bar at the top shows your chance of police attention each year, from green (cool) to red (hot). It rises when you carry stock, sleep rough or cook, and more so in heavily policed districts. The safe is never touched. If the police do come for you, what happens depends on your heat:<br><b>Under 5%:</b> they leave you alone.<br><b>5–15%:</b> stop and search. They take some of your stock and fine you. Nothing happens if you are clean.<br><b>16–30%:</b> pulled over. If you are carrying stock you are arrested, with a chance to run, fight, give up or bribe.<br><b>31–55%:</b> undercover sting. A buyer turns out to be a cop and you are arrested if you are carrying stock.<br><b>56–89%:</b> police raid. Any batches cooking are seized, and you are arrested if you are carrying stock or are at your lab. You cannot run.<br><b>90% or more:</b> FBI raid. Your batches are seized, your lab and equipment are wrecked, you are fined 25% of your cash and you are arrested with extra years added to your sentence.<br>Bribe police in the Home tab to cut your heat for a few years, all the way up to the mayor.</p>'
 +'<p class="lead"><b>Trouble.</b> Travelling can bring police stops and muggers. Police stops and arrests give you four choices: run, fight, give up for a shorter sentence, or bribe. Muggers and burglars give you the first three. Fail and you go to jail for a sentence based on your stock, and you leave with full health and 70 fed. Lose and you go to jail for longer the more stock you carried. The stock is confiscated and the years pass.</p>'
 +'<p class="lead"><b>Casino.</b> Open the Casino tab to play blackjack, slots or roulette with your pocket cash. You get '+CASINO_LIMIT+' plays a year across all three games, and each hand, spin or round uses one. The house always has an edge, so it is a gamble, not a plan.</p>'
@@ -2496,7 +2717,7 @@ else if(a==='year'){S.day++;finishBatches(true);yearXp();coolMarkets(1);roll();i
 else if(a==='cas')S.cas=null;
 else if(a==='old')S.day=DAYS;
 else if(a==='die'){S.hp=0;S.view='over';M=null}
-else if(a==='manor'){var e={};GOODS.forEach(function(g){e[g.id]=1});S.prop={i:PROPS.length-1,loc:S.loc,lab:true,eq:e}}
+else if(a==='manor'){var e={};GOODS.forEach(function(g){e[g.id]=1});setP({i:PROPS.length-1,loc:S.loc,lab:true,eq:e})}
 save();render()}
 
 /** True when the last password attempt was wrong (shows the red message). */
@@ -2546,7 +2767,7 @@ function back(){M=MB;MB=null;render()}
 function menuView(){var t='<div class="top"><h1>Kingpin: Bloodline</h1></div>';
 if(M==='log')return t+'<div class="card"><h2>History</h2><p class="log">Everything this character has been through.</p>'+S.log.map(function(l){return '<p class="lead" style="font-size:14px">'+l+'</p>'}).join('')+'<button class="main full" onclick="M=null;render()">Back</button></div>';
 if(M==='tree')return t+treeView();
-if(M==='assign'){var k=AS.k,pp=S.prop,list=ug().filter(function(g){return k==='sell'||(pp&&pp.eq&&pp.eq[g.id])});return t+'<div class="card"><h2>'+(k==='cook'?'Cook which drug?':'Sell which drug?')+'</h2><p class="log">'+S.fam[AS.i].n+'. '+(k==='cook'?'Needs the lab and equipment for that drug.':'Sells up to 10 units a year from your safe.')+'</p>'+(list.length?list.map(function(g){return '<button class="opt" onclick="setTask(\''+g.id+'\')">'+g.n+'</button>'}).join(''):'<p class="lead">Nothing available yet.</p>')+'<button class="full" onclick="back()">Cancel</button></div>'}
+if(M==='assign'){var k=AS.k,pp=P(),list=ug().filter(function(g){return k==='sell'||(pp&&pp.eq&&pp.eq[g.id])});return t+'<div class="card"><h2>'+(k==='cook'?'Cook which drug?':'Sell which drug?')+'</h2><p class="log">'+S.fam[AS.i].n+'. '+(k==='cook'?'Needs the lab and equipment for that drug.':'Sells up to 10 units a year from your safe in '+AREAS[S.loc].n+'.')+'</p>'+(list.length?list.map(function(g){return '<button class="opt" onclick="setTask(\''+g.id+'\')">'+g.n+'</button>'}).join(''):'<p class="lead">Nothing available yet.</p>')+'<button class="full" onclick="back()">Cancel</button></div>'}
 if(M==='help')return t+'<div class="card"><h2>How to play</h2>'+HELP+'<button class="main full" onclick="back()">Back</button></div>';
 if(M==='confirm')return t+'<div class="card"><h2>Start a new game?</h2><p class="lead">This erases your current character and their whole family line. You can’t undo it.</p><button class="danger full" onclick="M=null;newGame()">Yes, start over</button><button class="full" onclick="back()">Cancel</button></div>';
 if(M==='devpw'){var pi='width:100%;min-height:44px;background:#0B0F14;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:600 16px Barlow,sans-serif';return t+'<div class="card"><h2>Dev tools</h2><p class="log">Enter the password to continue.</p><label for="dpw"><small class="log">Password</small></label><input id="dpw" type="password" style="'+pi+'" autocomplete="off" autocapitalize="off" onkeydown="if(event.key===\'Enter\')devCheck()">'+(DERR?'<p class="up" role="alert" style="margin:8px 0 0">Wrong password.</p>':'')+'<button class="main full" onclick="devCheck()">Unlock</button><button class="full" onclick="go(\'menu\')">Cancel</button></div>'}

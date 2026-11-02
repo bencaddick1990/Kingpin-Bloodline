@@ -128,6 +128,13 @@ button:disabled{opacity:.35}
 
 /* Button groups and layout helpers. */
 .btns{display:flex;gap:6px}
+
+/* Market row buttons (.btns.trade): Buy 1 / Buy max on top, Sell 1 / Sell max
+   underneath. A 2x2 grid keeps four 44px touch targets readable on a 360px
+   phone, where four buttons in one line would crush the drug name column.
+   Fixed track width (not 1fr of the row) so every drug's grid lines up. */
+.btns.trade{display:grid;grid-template-columns:repeat(2,76px);gap:6px}
+.btns.trade button{padding:8px 4px;font-size:14px;white-space:nowrap}
 .full{width:100%;margin-top:8px}
 
 /* Muted log text (event feed, hints). */
