@@ -59,16 +59,18 @@
  * ========================================================================== */
 
 /** VERSION NUMBER: change the number on the next line each release. */
-var VERSION='0.48';
+var VERSION='0.49';
 
 /** Game-wide constants.
  *  CAP  : pocket slots with no bag.
  *  DAYS : number of "years" (turns) per life (age 18 to 68).
  *  AGE0 : age offset, so age = AGE0 + day (day 1 => age 18).
  *  LAB  : cost to build a lab in a property.
+ *  LABDISC : discount applied to a drug's LOWEST list price (g.lo) to get the
+ *            fixed lab ingredient cost per unit (0.1 = 10% below the lowest).
  *  S    : the one global game-state object (created by newGame()/load()).
  *  best : best net worth ever reached on this device. */
-var CAP=15,DAYS=50,AGE0=17,LAB=1200,S,best=0;
+var CAP=15,DAYS=50,AGE0=17,LAB=1200,LABDISC=.1,S,best=0;
 
 
 /* ============================================================================
@@ -1938,15 +1940,17 @@ return '<div class="card"><h2>Safe</h2><p class="log">Safe from muggings, raids 
  * ========================================================================== */
 
 /**
- * Ingredient cost per unit.
- * MATH: 80% of the LOWER of (a) the drug's average list price (lo+hi)/2 and
- * (b) today's local price. Taking the lower means a price crash also cheapens
- * ingredients, but a price spike never makes them dearer; always at least
- * 20% under market. Minimum £1, whole number.
+ * Ingredient cost per unit: a FIXED price, identical every year.
+ * MATH: cost = round(g.lo * (1 - LABDISC)). g.lo is the drug's lowest
+ * standard list price (the bottom of its GOODS range), so it ignores district
+ * bias, market fatigue and the random "cheap"/"spike" events. Example: Weed
+ * lo = 15 -> 15 * 0.9 = 13.5 -> rounds to £14. Because the price never reads
+ * S.prices, the player and the crew pay the same amount every batch (the crew
+ * adds its 15% fee on top in crewYear). Minimum £1, whole number.
  * @param {Object} g - A GOODS entry.
  * @returns {number} Pounds per unit.
  */
-function ing(g){return Math.max(1,Math.round(Math.min((g.lo+g.hi)/2,S.prices[g.id])*.8))}
+function ing(g){return Math.max(1,Math.round(g.lo*(1-LABDISC)))}
 
 /**
  * Finds a GOODS entry by id.
@@ -1994,7 +1998,7 @@ if(!p)return c+'<p class="lead">You need a property first. Buy one in the Home t
 if(p.loc!==S.loc)return c+'<p class="lead">Your lab is at your '+PROPS[p.i].n.toLowerCase()+' in '+AREAS[p.loc].n+'. Travel there to cook.</p></div>';
 if(!p.lab)return c+'<p class="lead">Your '+PROPS[p.i].n.toLowerCase()+' has no lab yet. Selling or trading up the property loses the lab and its equipment.</p><button class="main full" onclick="buildLab()" '+(S.cash<LAB?'disabled':'')+'>Build lab · '+gbp(LAB)+'</button></div>';
 var eq=p.eq||{},free=room(),bt=p.batch||{},cf=Math.max(0,safeCap()-safeCount())+Math.max(0,cap()-carried());
-return c+'<p class="log">One batch of each drug at a time, ready next year. Ingredients cost 80% of the usual price, or of today\u2019s price if that\u2019s lower, so always under market. Space for '+free+' more. Heat is '+raidPct()+'%'+(cooks()<5?'; one more drug cooking would make it '+raidPct(cooks()+1)+'%':'')+'.</p>'+ug().map(function(g){var u=ing(g),has=eq[g.id],m=Math.min(free,Math.floor(S.cash/u)),off=m<1?'disabled':'',b=bt[g.id];return '<div class="row"><div class="nm"><b>'+g.n+'</b><small>'+(has?'Ingredients '+gbp(u)+' each · market '+gbp(S.prices[g.id]):'Equipment '+gbp(g.eq))+'</small></div>'+(has&&b?'<div style="text-align:right"><small>'+(b.w?b.n+' waiting for room':'Cooking '+b.n+', ready next year')+'</small>'+(b.w?'<button class="mini" style="display:block;margin:4px 0 0 auto" onclick="collect(\''+g.id+'\')"'+(cf<1?' disabled':'')+'>Collect '+Math.min(b.n,cf)+'</button>':'')+'</div>':has?'<div class="btns"><button onclick="cook(\''+g.id+'\',1)" '+off+'>Cook 1</button><button onclick="cook(\''+g.id+'\',10)" '+off+'>Cook 10</button><button onclick="cook(\''+g.id+'\',9999)" '+off+'>Max '+m+'</button></div>':'<button onclick="buyEq(\''+g.id+'\')" '+(S.cash<g.eq?'disabled':'')+'>Buy</button>')+'</div>'}).join('')+'</div>'}
+return c+'<p class="log">One batch of each drug at a time, ready next year. Ingredients always cost the same: 10% below the lowest normal price of that drug, whatever the market is doing. Space for '+free+' more. Heat is '+raidPct()+'%'+(cooks()<5?'; one more drug cooking would make it '+raidPct(cooks()+1)+'%':'')+'.</p>'+ug().map(function(g){var u=ing(g),has=eq[g.id],m=Math.min(free,Math.floor(S.cash/u)),off=m<1?'disabled':'',b=bt[g.id];return '<div class="row"><div class="nm"><b>'+g.n+'</b><small>'+(has?'Ingredients '+gbp(u)+' each · market '+gbp(S.prices[g.id]):'Equipment '+gbp(g.eq))+'</small></div>'+(has&&b?'<div style="text-align:right"><small>'+(b.w?b.n+' waiting for room':'Cooking '+b.n+', ready next year')+'</small>'+(b.w?'<button class="mini" style="display:block;margin:4px 0 0 auto" onclick="collect(\''+g.id+'\')"'+(cf<1?' disabled':'')+'>Collect '+Math.min(b.n,cf)+'</button>':'')+'</div>':has?'<div class="btns"><button onclick="cook(\''+g.id+'\',1)" '+off+'>Cook 1</button><button onclick="cook(\''+g.id+'\',10)" '+off+'>Cook 10</button><button onclick="cook(\''+g.id+'\',9999)" '+off+'>Max '+m+'</button></div>':'<button onclick="buyEq(\''+g.id+'\')" '+(S.cash<g.eq?'disabled':'')+'>Buy</button>')+'</div>'}).join('')+'</div>'}
 
 
 /* ============================================================================
@@ -2433,7 +2437,7 @@ var HELP='<p class="lead">Build a fortune across generations. Each turn is one y
 +'<p class="lead"><b>Guns.</b> Buy them in the Guns tab. Your best one boosts your odds in fights but adds years to your sentence if police find it.</p>'
 +'<p class="lead"><b>Bank.</b> Open the Home tab to deposit or withdraw cash. Money in the bank can’t be robbed, seized in a raid or taken by a fine, and it counts toward your net worth. Your heir inherits half.</p>'
 +'<p class="lead"><b>Safe.</b> Every property has a safe. Stock inside is safe from muggings, raids and jail, but you can only reach it when you’re at the property. Better properties hold more. You can’t sell the property while the safe has stock in it, but you can upgrade and the stock moves with you.</p>'
-+'<p class="lead"><b>Lab.</b> At a property you can build a lab, buy equipment for each drug, then cook one batch of each drug at once. A batch finishes when the year passes and goes into your safe first. Ingredients always cost at least 20% under market. The lab and equipment go with the property. If a finished batch is waiting for room, free some space and press Collect to take what fits straight away. Crew batches are collected first at the turn of the year.</p>'
++'<p class="lead"><b>Lab.</b> At a property you can build a lab, buy equipment for each drug, then cook one batch of each drug at once. A batch finishes when the year passes and goes into your safe first. Ingredients always cost the same: 10% below the lowest normal price of each drug, whatever the market is doing. The lab and equipment go with the property. If a finished batch is waiting for room, free some space and press Collect to take what fits straight away. Crew batches are collected first at the turn of the year.</p>'
 +'<p class="lead"><b>Heat.</b> The heat bar at the top shows your chance of police attention each year, from green (cool) to red (hot). It rises when you carry stock, sleep rough or cook, and more so in heavily policed districts. The safe is never touched. If the police do come for you, what happens depends on your heat:<br><b>Under 5%:</b> they leave you alone.<br><b>5–15%:</b> stop and search. They take some of your stock and fine you. Nothing happens if you are clean.<br><b>16–30%:</b> pulled over. If you are carrying stock you are arrested, with a chance to run, fight, give up or bribe.<br><b>31–55%:</b> undercover sting. A buyer turns out to be a cop and you are arrested if you are carrying stock.<br><b>56–89%:</b> police raid. Any batches cooking are seized, and you are arrested if you are carrying stock or are at your lab. You cannot run.<br><b>90% or more:</b> FBI raid. Your batches are seized, your lab and equipment are wrecked, you are fined 25% of your cash and you are arrested with extra years added to your sentence.<br>Bribe police in the Home tab to cut your heat for a few years, all the way up to the mayor.</p>'
 +'<p class="lead"><b>Trouble.</b> Travelling can bring police stops and muggers. Police stops and arrests give you four choices: run, fight, give up for a shorter sentence, or bribe. Muggers and burglars give you the first three. Fail and you go to jail for a sentence based on your stock, and you leave with full health and 70 fed. Lose and you go to jail for longer the more stock you carried. The stock is confiscated and the years pass.</p>'
 +'<p class="lead"><b>Casino.</b> Open the Casino tab to play blackjack, slots or roulette with your pocket cash. You get '+CASINO_LIMIT+' plays a year across all three games, and each hand, spin or round uses one. The house always has an edge, so it is a gamble, not a plan.</p>'
