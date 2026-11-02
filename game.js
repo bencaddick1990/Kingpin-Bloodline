@@ -59,7 +59,7 @@
  * ========================================================================== */
 
 /** VERSION NUMBER: change the number on the next line each release. */
-var VERSION='0.49';
+var VERSION='0.50';
 
 /** Game-wide constants.
  *  CAP  : pocket slots with no bag.
@@ -1333,7 +1333,7 @@ if(S.tab==='trade')h+=jobsView();if(S.tab==='food'){h+='<div class="card"><h2>Fo
 /* TRAVEL TAB: district list with a police-presence label from heat: <0.7 light, <1.1 moderate, else heavy */
 if(S.tab==='go'){h+='<div class="card"><h2>Move to another district</h2><p class="log">Travelling costs 10 fed and risks a stop or a mugging. Busier districts mean more police.</p>'+AREAS.map(function(x,i){return '<div class="row"><div class="nm"><b>'+x.n+'</b><small>Police '+(x.heat<.7?'light':x.heat<1.1?'moderate':'heavy')+'</small></div><button onclick="travel('+i+')" '+(i===S.loc?'disabled':'')+'>'+(i===S.loc?'Here':'Go')+'</button></div>'}).join('')+'</div>'}
 /* HOME TAB: safe + bank + property list. Buying a new property needs cash PLUS the 80% resale of the one you'd replace (that's the S.cash+... check); blocked() adds level/lock rules. */
-if(S.tab==='home'){h+=safeView()+bankView()+'<div class="card"><h2>Property</h2>'+(S.prop?'<p class="lead">You own a '+PROPS[S.prop.i].n.toLowerCase()+' in '+AREAS[S.prop.loc].n+'. Upkeep '+gbp(PROPS[S.prop.i].up)+' a year. '+(S.prop.i===0?'It can\u2019t be sold, but trading up still gives you '+gbp(PROPS[0].c*.8)+' back.':'It sells for '+gbp(PROPS[S.prop.i].c*.8)+'.')+' Safe holds '+SLOTS[S.prop.i]+'.</p>'+(S.prop.lab?'<p class="log">Your lab and equipment go with the property if you sell or trade up.</p>':'')+(locked()?'<p class="log">You can’t sell while the safe has stock or a batch is running. Upgrading moves your stock to the new safe, but the lab and equipment stay behind, so let batches finish first.</p>':'')+(S.prop.i===0?'':'<button class="danger full" onclick="sellProp()"'+(locked()?' disabled':'')+'>Sell property</button>'):'<p class="lead">No place of your own, so you sleep rough: cold, and easy prey. Buy a place in '+AREAS[S.loc].n+' to sleep safely whenever you end the day here.</p>')+PROPS.map(function(p,i){return '<div class="row"><div class="nm"><b>'+p.n+'</b> '+gbp(p.c)+'<small>Upkeep '+gbp(p.up)+' a year. Safe slots: '+SLOTS[i]+'. '+(lvl()<p.u?'Unlocks at level '+p.u:p.info)+'</small></div><button onclick="buyProp('+i+')" '+(S.cash+(S.prop?PROPS[S.prop.i].c*.8:0)<p.c||blocked(i)?'disabled':'')+'>Buy</button></div>'}).join('')+'</div>'}
+if(S.tab==='home'){h+=safeView()+bankView()+'<div class="card"><h2>Property</h2>'+(S.prop?'<p class="lead">You own a '+PROPS[S.prop.i].n.toLowerCase()+' in '+AREAS[S.prop.loc].n+'. Upkeep '+gbp(PROPS[S.prop.i].up)+' a year. '+(S.prop.i===0?'It can\u2019t be sold, but trading up still gives you '+gbp(PROPS[0].c*.8)+' back.':'It sells for '+gbp(PROPS[S.prop.i].c*.8)+'.')+' Safe holds '+SLOTS[S.prop.i]+'.</p>'+(S.prop.lab?'<p class="log">Your lab and equipment go with the property if you sell or trade up.</p>':'')+(locked()?'<p class="log">You can’t sell while the safe has stock or a batch is running. Upgrading moves your stock to the new safe, but the lab and equipment stay behind, so let batches finish first.</p>':'')+(S.prop.i===0?'':'<button class="danger full" onclick="sellProp()"'+(locked()?' disabled':'')+'>Sell property</button>'):'<p class="lead">No place of your own, so you sleep rough: cold, and easy prey. Buy a place in '+AREAS[S.loc].n+' to sleep safely whenever you end the day here.</p>')+PROPS.map(function(p,i){return '<div class="row"><div class="nm"><b>'+p.n+'</b> '+gbp(p.c)+'<small>Upkeep '+gbp(p.up)+' a year. Safe slots: '+SLOTS[i]+'. '+(lvl()<p.u?'Unlocks at level '+p.u:p.info)+'</small></div><button onclick="buyProp('+i+')" '+(owns(i)||S.cash+(S.prop?PROPS[S.prop.i].c*.8:0)<p.c||blocked(i)?'disabled':'')+'>'+(owns(i)?'Already owned':'Buy')+'</button></div>'}).join('')+'</div>'}
 /* REMAINING TABS delegate to their own builders */
 if(S.tab==='home')h+=bribeView();
 if(S.tab==='lab')h+=labView();
@@ -1652,13 +1652,23 @@ function sellProp(){var d=PROPS[S.prop.i];if(locked()||S.prop.i===0)return;S.cas
 
 /**
  * Whether the Buy button for property i must be disabled (rules beyond cash).
- * RULES: level too low -> blocked. If you already own one: upgrading
+ * RULES: already owned -> blocked (no duplicate purchases). Level too low -> blocked. If you already own one: upgrading
  * (i higher) is blocked while batches are running (they'd be lost); buying
  * anything else is blocked while the safe or lab is in use (locked()).
  * @param {number} i - PROPS index.
  * @returns {boolean}
  */
-function blocked(i){return lvl()<PROPS[i].u||(!!S.prop&&(i>S.prop.i?pend()>0:locked()))}
+function blocked(i){return owns(i)||lvl()<PROPS[i].u||(!!S.prop&&(i>S.prop.i?pend()>0:locked()))}
+
+/**
+ * Do you already own property tier i? Only one property can be held at a time,
+ * so re-buying the same tier would just sell it at 80% and buy it back (losing
+ * 20% and wiping the lab). This is the "already owned" test used to grey out
+ * the Buy button and to reject the purchase inside buyProp() via blocked().
+ * @param {number} i - PROPS index.
+ * @returns {boolean} True if the player currently owns that property.
+ */
+function owns(i){return !!S.prop&&S.prop.i===i}
 
 
 /* ============================================================================
