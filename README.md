@@ -92,7 +92,7 @@ STARTUP: stIntro() -> stPanel('main') -> stNew()/stLoad() -> newGame()/load() ->
 
 `day` (year of life), `gen`, `cash`, `bank`, `hp`, `food`, `loc` (district),
 `inv{}` / `paid{}` (stock and average cost), `prices{}`, `base{}`, `flag{}`
-(spike/cheap), `news{}` (headline per flagged drug), `pre{}` (bought tip-offs),
+(spike/cheap), `news{}` (headline per flagged drug), `yb{}` (this year's price board per district, one per year), `pre{}` (bought tip-offs),
 `props[]`, `guns[]`, `bag`, `xp`, `bribe`, `fat{}` (market fatigue), `yp{}` (XP
 ledger), `fam[]`, `line[]`, `look{}`, `view`, `tab`, `tut` (tutorial step), `ev`,
 `log[]`.
